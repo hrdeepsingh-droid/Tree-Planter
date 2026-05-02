@@ -40,6 +40,14 @@
 //         group as "rows" (orchard convention). Detection telemetry
 //         (bearings, spacings, kept/total counts) is returned in the
 //         /field/dxf JSON response and surfaced in the upload status pane.
+// 1.5.5 — DXF: (1) intersections[] now PSRAM-backed with cap raised from
+//         2,000 to 32,000 — supports any realistic single-block planting
+//         without overflow. (2) Coord-frame switched from raw MGA-subtract
+//         to UTM-inverse → flat-Earth-from-anchor: each parsed DXF
+//         endpoint is converted MGA → lat/lon (utmToLatLon) then to AOG's
+//         local frame (latLonToLocal). This matches the frame AOG uses
+//         for TrackLines, so dots and tracklines plot at the same place
+//         instead of drifting ~1 m per 3 km from anchor.
 // 1.5.4 — Map preview: /api/grid was gated on gHasLines (the AOG ABLines
 //         recipe flag), which is always false after a DXF upload. The
 //         tree-points loop silently skipped, the map fell through to
@@ -60,7 +68,7 @@
 //         as grid" that switches source and scrolls to the upload card;
 //         (5) numIntersections / gNumRows / gNumTrees are zeroed on every
 //         /field/apply so old dots don't bleed through after a mode swap.
-#define FW_VERSION "1.5.4"
+#define FW_VERSION "1.5.5"
 
 // ================================================================
 //  COMPILED-IN DEFAULTS — overridden by Preferences after first save
@@ -109,9 +117,12 @@
 #define DEF_EDGE_ROW   "DXF-Row-Edge"
 #define DEF_EDGE_TREE  "DXF-Tree-Edge"
 
-// Max intersections we pre-compute and store in RAM.
-// 2000 × 8 bytes = 16KB — comfortable on ESP32-S3.
-#define MAX_INTERSECTIONS 2000
+// v1.5.5: max intersections we pre-compute and store. Allocated from
+// PSRAM at boot (8 MB available), so a 32,000-tree cap is cheap (~256 KB).
+// Covers any single-block planting up to 200 × 160 at 6m × 3m row/tree
+// spacing. Runtime cap is gIntersectionsCap (falls back to 2000 if
+// PSRAM is unavailable).
+#define MAX_INTERSECTIONS 32000
 
 // Max boundary polygon vertices. 256 × 8 bytes = 2KB, and typical
 // orchard boundaries have <100 points.
@@ -211,7 +222,8 @@ bool   gHasEdges = false;
 
 // AB-mode geometry (declared up here so loadPrefs can populate them).
 struct IPt { float e; float n; };
-IPt  intersections[MAX_INTERSECTIONS];
+IPt* intersections    = nullptr;   // PSRAM-backed; allocated in setup()
+int  gIntersectionsCap = 0;        // runtime capacity (≤ MAX_INTERSECTIONS)
 int  numIntersections = 0;
 IPt  boundary[MAX_BOUNDARY];
 int  numBoundary = 0;
@@ -290,7 +302,7 @@ void loadPrefs() {
   lastRawIntersections = 0;
   if (gGridSource == SRC_DXF) {
     size_t want = prefs.getBytesLength("dxf_pts");
-    if (want > 0 && want <= sizeof(intersections)) {
+    if (want > 0 && want <= (size_t)gIntersectionsCap * sizeof(IPt)) {
       prefs.getBytes("dxf_pts", intersections, want);
       numIntersections = want / sizeof(IPt);
       lastRawIntersections = numIntersections;
@@ -2198,7 +2210,7 @@ static bool buildDxfIntersections() {
       double iN = R.y1 + u * rDy;
       lastRawIntersections++;
       if (gHasBoundary && !pointInBoundary(iE, iN)) continue;
-      if (numIntersections >= MAX_INTERSECTIONS) { overflow = true; continue; }
+      if (numIntersections >= gIntersectionsCap) { overflow = true; continue; }
       intersections[numIntersections].e = (float)iE;
       intersections[numIntersections].n = (float)iN;
       numIntersections++;
@@ -2389,7 +2401,7 @@ void buildAbIntersections() {
     double baseE = gAbOriginE + r * gRowSpacing * treeDE;
     double baseN = gAbOriginN + r * gRowSpacing * treeDN;
     for (int t = 0; t < gNumTrees; t++) {
-      if (numIntersections >= MAX_INTERSECTIONS) break;
+      if (numIntersections >= gIntersectionsCap) break;
       double iE = baseE + t * gTreeSpacing * rowDE;
       double iN = baseN + t * gTreeSpacing * rowDN;
       lastRawIntersections++;
@@ -2955,7 +2967,7 @@ void handleFieldApply() {
     if (gGridMode == MODE_AB) {
       prefs.begin("tm", true);
       size_t want = prefs.getBytesLength("dxf_pts");
-      if (want > 0 && want <= sizeof(intersections)) {
+      if (want > 0 && want <= (size_t)gIntersectionsCap * sizeof(IPt)) {
         prefs.getBytes("dxf_pts", intersections, want);
         numIntersections = want / sizeof(IPt);
         lastRawIntersections = numIntersections;
@@ -3127,27 +3139,29 @@ void handleDxfUploadEnd() {
   }
   gAnchorLat = aLat; gAnchorLon = aLon; gHasField = true;
 
-  // v1.5.3: Re-frame the parsed DXF segments. CAD output is normally in
-  // projected metres (UTM/MGA easting/northing, e.g. 626219.750,
-  // 6183177.000 in zone 54 for Sunraysia), but everything downstream —
-  // intersections[], hit detection vs GPS-derived local frame, the
-  // TrackLines.txt export, the map preview — assumes coordinates in
-  // metres relative to the StartFix anchor. Without this conversion,
-  // intersection coordinates land ~6 million metres off, the relay
-  // never fires, and AOG draws TrackLines off-screen. Project the
-  // anchor to MGA in its UTM zone and subtract from every segment.
+  // v1.5.5: Re-frame the parsed DXF segments to AgOpenGPS local frame.
+  // CAD output is in projected metres (UTM/MGA easting/northing). AOG's
+  // local frame, however, is flat-Earth-from-StartFix using metres-per-
+  // degree (≈111,320 × cos(lat) for east, ≈111,320 for north), NOT raw
+  // UTM. The two frames diverge with distance from anchor (~0.04% scale
+  // difference, ~1.2 m at 3 km) — enough to throw a tractor off a 3 m
+  // tree row. v1.5.3 used a raw MGA subtract which preserved that
+  // mismatch. Now we invert each DXF endpoint MGA → lat/lon, then
+  // convert to AOG local frame via latLonToLocal so intersections,
+  // TrackLines.txt, and map markers all share the frame AOG uses.
   {
     int zone = (int)floor((gAnchorLon + 180.0) / 6.0) + 1;
-    double anchorE = 0, anchorN = 0;
-    latLonToUTM(gAnchorLat, gAnchorLon, zone, anchorE, anchorN);
-    Serial.printf("[DXF] re-framing %d segments: zone=%d anchorMGA=(%.2f,%.2f)\n",
-                  gDxfLineCount, zone, anchorE, anchorN);
+    Serial.printf("[DXF] re-framing %d segments to AOG local frame: zone=%d anchor=(%.7f,%.7f)\n",
+                  gDxfLineCount, zone, gAnchorLat, gAnchorLon);
     for (int i = 0; i < gDxfLineCount; i++) {
       DxfLine& L = gDxfLines[i];
-      L.x1 = (float)((double)L.x1 - anchorE);
-      L.y1 = (float)((double)L.y1 - anchorN);
-      L.x2 = (float)((double)L.x2 - anchorE);
-      L.y2 = (float)((double)L.y2 - anchorN);
+      double lat, lon, le, ln;
+      utmToLatLon((double)L.x1, (double)L.y1, zone, lat, lon);
+      latLonToLocal(lat, lon, le, ln);
+      L.x1 = (float)le; L.y1 = (float)ln;
+      utmToLatLon((double)L.x2, (double)L.y2, zone, lat, lon);
+      latLonToLocal(lat, lon, le, ln);
+      L.x2 = (float)le; L.y2 = (float)ln;
     }
   }
 
@@ -3470,6 +3484,21 @@ void setup() {
     oled.printf("Tree Marker v%s\n", FW_VERSION);
     oled.println("Starting...");
     oled.display();
+  }
+
+  // v1.5.5: allocate the intersections array from PSRAM. Sized for up to
+  // MAX_INTERSECTIONS (32,000) trees so a real-deployment DXF won't hit
+  // the cap. Falls back to heap with a smaller cap if PSRAM is unavailable.
+  intersections = (IPt*)ps_malloc(sizeof(IPt) * MAX_INTERSECTIONS);
+  if (intersections) {
+    gIntersectionsCap = MAX_INTERSECTIONS;
+    Serial.printf("[BOOT] intersections cap=%d (PSRAM, %u bytes)\n",
+                  gIntersectionsCap, (unsigned)(sizeof(IPt) * MAX_INTERSECTIONS));
+  } else {
+    gIntersectionsCap = 2000;
+    intersections = (IPt*)malloc(sizeof(IPt) * gIntersectionsCap);
+    Serial.printf("[BOOT] PSRAM unavailable; intersections cap=%d (heap)\n",
+                  gIntersectionsCap);
   }
 
   loadPrefs();
