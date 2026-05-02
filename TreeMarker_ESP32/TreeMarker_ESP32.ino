@@ -6,7 +6,7 @@
 // Board  : ESP32 Dev Module
 // Libs   : ArduinoJson v6, WebSockets by Markus Sattler
 // Fixed pins : RELAY 26 | LED 2 | GPS_RX 16 | GPS_TX 17
-// Fixed ports: UDP field 8899 | HTTP 80 | WS 81
+// Fixed ports: UDP field 8888 | HTTP 80 | WS 81
 
 #include <Arduino.h>
 #include <WiFi.h>

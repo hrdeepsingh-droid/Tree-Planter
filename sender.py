@@ -25,8 +25,8 @@ DXF_FILE = "C:/AutoCAD/tree_layout.dxf"
 # IP address of the ESP32 on the field WiFi network
 ESP32_IP = "192.168.1.100"
 
-# UDP port – must match UDP_PORT in the sketch (default 8899)
-ESP32_PORT = 8899
+# UDP port – must match UDP_PORT in the sketch (default 8888)
+ESP32_PORT = 8888
 
 # Set True to also read and send Boundary.txt in AgOpenGPS mode
 INCLUDE_BOUNDARY = True

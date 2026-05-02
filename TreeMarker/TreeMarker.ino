@@ -36,7 +36,7 @@
 
 // ─── Network ports ────────────────────────────────────────────────────────────
 #define GPS_UDP_PORT    9999   // AgIO $GNGGA / $GNRMC broadcast
-#define FIELD_UDP_PORT  8899   // sender.py JSON field data
+#define FIELD_UDP_PORT  8888   // sender.py JSON field data
 
 // ─── OLED ─────────────────────────────────────────────────────────────────────
 #define OLED_W   128
@@ -417,7 +417,7 @@ void readGpsUDP() {
     }
 }
 
-// ─── Field data via UDP (sender.py, port 8899) ────────────────────────────────
+// ─── Field data via UDP (sender.py, port 8888) ────────────────────────────────
 void processFieldUDP() {
     int len = fieldUdp.parsePacket();
     if (len <= 0) return;
