@@ -40,6 +40,11 @@
 //         group as "rows" (orchard convention). Detection telemetry
 //         (bearings, spacings, kept/total counts) is returned in the
 //         /field/dxf JSON response and surfaced in the upload status pane.
+// 1.5.4 — Map preview: /api/grid was gated on gHasLines (the AOG ABLines
+//         recipe flag), which is always false after a DXF upload. The
+//         tree-points loop silently skipped, the map fell through to
+//         the empty simple-mode grid[][] and showed nothing. Now gates
+//         on (numIntersections > 0), so DXF-derived trees render too.
 // 1.5.3 — DXF fixes from real-world test: (1) bearing centroid now uses
 //         circular mean on doubled angle (sum of cos 2θ / sin 2θ), so
 //         clusters straddling the 0°/180° wrap collapse instead of being
@@ -55,7 +60,7 @@
 //         as grid" that switches source and scrolls to the upload card;
 //         (5) numIntersections / gNumRows / gNumTrees are zeroed on every
 //         /field/apply so old dots don't bleed through after a mode swap.
-#define FW_VERSION "1.5.3"
+#define FW_VERSION "1.5.4"
 
 // ================================================================
 //  COMPILED-IN DEFAULTS — overridden by Preferences after first save
@@ -3252,12 +3257,18 @@ void handleGrid() {
   bool first = true;
   char buf[72];
 
-  if (gGridMode == MODE_AB && gHasLines && gHasField) {
+  // v1.5.4: gate on intersections[] having data, not on gHasLines —
+  // gHasLines is false for DXF source (no AB-line recipe), so the old
+  // condition silently skipped DXF-derived trees and fell through to
+  // the empty simple-mode grid. The map saw zero dots despite the
+  // firmware having a full intersections array.
+  if (gGridMode == MODE_AB && gHasField && numIntersections > 0) {
+    int treesPerRow = (gNumTrees > 0) ? gNumTrees : 1;
     for (int i = 0; i < numIntersections; i++) {
       double lat, lon;
       localToLatLon(intersections[i].e, intersections[i].n, lat, lon);
-      int r = i / gNumTrees;
-      int t = i % gNumTrees;
+      int r = i / treesPerRow;
+      int t = i % treesPerRow;
       int n = snprintf(buf, sizeof(buf), "%s[%.7f,%.7f,%d,%d]",
                        first ? "" : ",", lat, lon, r, t);
       out.concat(buf, n);
