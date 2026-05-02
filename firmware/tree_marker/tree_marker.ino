@@ -40,6 +40,13 @@
 //         group as "rows" (orchard convention). Detection telemetry
 //         (bearings, spacings, kept/total counts) is returned in the
 //         /field/dxf JSON response and surfaced in the upload status pane.
+// 1.5.6 — /api/grid was building one Arduino String containing every
+//         intersection (~32 bytes/point), which at 32K points = ~1 MB
+//         vs ~200 KB free heap → OOM/truncation, blank map. Capped the
+//         display response at GRID_DISPLAY_CAP=4000 with stride-sampling
+//         when intersections exceed that. Full intersections[] is still
+//         used for hit detection; only the dashboard visualization is
+//         sampled.
 // 1.5.5 — DXF: (1) intersections[] now PSRAM-backed with cap raised from
 //         2,000 to 32,000 — supports any realistic single-block planting
 //         without overflow. (2) Coord-frame switched from raw MGA-subtract
@@ -68,7 +75,7 @@
 //         as grid" that switches source and scrolls to the upload card;
 //         (5) numIntersections / gNumRows / gNumTrees are zeroed on every
 //         /field/apply so old dots don't bleed through after a mode swap.
-#define FW_VERSION "1.5.5"
+#define FW_VERSION "1.5.6"
 
 // ================================================================
 //  COMPILED-IN DEFAULTS — overridden by Preferences after first save
@@ -3256,9 +3263,13 @@ void handleDxfRaw() {
 // GET /api/grid — planned tree positions as lat/lon, either from
 // the Simple grid[][] or from intersections[] in AB mode. Designed
 // for the dashboard Map tab to plot without needing its own maths.
-// Builds the full response string in memory first (up to ~30KB at
-// MAX_INTERSECTIONS=2000) — chunked streaming was flaky with many
-// small sendContent calls, and we have plenty of RAM.
+// v1.5.6: response is capped to GRID_DISPLAY_CAP points with stride
+// sampling when intersections exceed it. Hit detection still uses the
+// full intersections[] array — only the visualization is sampled.
+// Reason: at 32K trees × ~30 bytes per point = ~1 MB, building the
+// JSON in a single Arduino String thrashes the ~200 KB free heap and
+// the response either OOMs or truncates, leaving the map blank.
+#define GRID_DISPLAY_CAP 4000
 void handleGrid() {
   String out;
   out.reserve(32768);
@@ -3278,7 +3289,10 @@ void handleGrid() {
   // firmware having a full intersections array.
   if (gGridMode == MODE_AB && gHasField && numIntersections > 0) {
     int treesPerRow = (gNumTrees > 0) ? gNumTrees : 1;
-    for (int i = 0; i < numIntersections; i++) {
+    int stride = (numIntersections > GRID_DISPLAY_CAP)
+                 ? (numIntersections / GRID_DISPLAY_CAP) : 1;
+    if (stride < 1) stride = 1;
+    for (int i = 0; i < numIntersections; i += stride) {
       double lat, lon;
       localToLatLon(intersections[i].e, intersections[i].n, lat, lon);
       int r = i / treesPerRow;
