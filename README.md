@@ -21,26 +21,24 @@ TreeMarker/
 ## Wiring
 
 ```
-ESP32 Dev Module
-┌─────────────────────────────────────────────────────┐
-│  GPIO 16 (RX2)  ←──[1kΩ]──[2kΩ to GND]──  GPS TX  │  voltage divider for 5V GPS modules
-│  GPIO 17 (TX2)  ──────────────────────────  GPS RX  │  (only needed if sending config to GPS)
-│                                                      │
-│  GPIO 26        ──────────────────────────  Relay IN │  active HIGH
-│  5V / Vin       ──────────────────────────  Relay VCC│
-│  GND            ──────────────────────────  Relay GND│
-└─────────────────────────────────────────────────────┘
+KinCony ALR  (ESP32-S3-WROOM-1U N16R8)
+┌──────────────────────────────────────────────────────────┐
+│  GPIO 48        ──────────────────────────  On-board relay│  active HIGH (built-in)
+│  GPIO 39 (SDA)  ──────────────────────────  OLED SDA     │  built-in SSD1306 128×64
+│  GPIO 38 (SCL)  ──────────────────────────  OLED SCL     │
+└──────────────────────────────────────────────────────────┘
 
-Relay module wiring:
-  COM  ──  12V +ve
-  NO   ──  Solenoid +ve
-           Solenoid –ve  ──  12V GND (common with ESP32 GND)
+GPS source: AgIO broadcasts $GNGGA / $GNRMC as UDP datagrams to port 9999.
+No hardware serial wiring is needed — the ESP32 receives GPS over WiFi.
 
-NOTE: Use an optocoupler relay module to isolate the ESP32 from
-      inductive kickback from the solenoid.
+Relay (on-board):
+  The KinCony ALR board has an integrated relay.
+  Wire the solenoid to the board's relay terminals (COM / NO).
+  Use a flyback diode across the solenoid coil to suppress inductive kickback.
 ```
 
-GPS baud rate default: **9600**. Change `Serial2.begin(9600, ...)` in `setup()` if your GPS module uses a different rate. The system reads `$GNGGA` (position + fix quality) and `$GNRMC` (heading + speed).
+**GPS** arrives via UDP port **9999** from AgOpenGPS AgIO — no serial cable needed.
+The sketch reads `$GNGGA` (position + fix quality) and `$GNRMC` (heading + speed).
 
 ---
 
@@ -60,11 +58,15 @@ Open **Sketch → Include Library → Manage Libraries** and install:
 |---------|--------|---------|
 | ArduinoJson | Benoit Blanchon | **6.x** (not v7) |
 | WebSockets | Markus Sattler | latest |
+| Adafruit SSD1306 | Adafruit | latest |
+| Adafruit GFX Library | Adafruit | latest |
 
-### 3. Select board settings
-- **Tools → Board → ESP32 Arduino → ESP32 Dev Module**
-- **Tools → Port** → your ESP32 COM port
-- **Tools → Upload Speed** → 921600
+### 3. Select board settings (KinCony ALR)
+- **Tools → Board → ESP32 Arduino → ESP32S3 Dev Module**
+- **Tools → Flash Size** → 16MB
+- **Tools → PSRAM** → OPI PSRAM
+- **Tools → USB CDC on Boot** → Enabled
+- **Tools → Port** → your ESP32 COM port (VID 303A / PID 1001)
 
 ---
 

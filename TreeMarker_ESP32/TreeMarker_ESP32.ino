@@ -1,12 +1,20 @@
 // TreeMarker_ESP32.ino
 // GPS-triggered relay mark-out system for tree planting.
-// Receives field grid data via UDP, tracks RTK nozzle position,
-// fires relay at GPIO26 when nozzle passes each tree position.
+// Receives field grid data via UDP (port 8888), tracks RTK nozzle position
+// via AgIO GPS broadcast (UDP 9999), fires relay when nozzle passes each tree.
 //
-// Board  : ESP32 Dev Module
-// Libs   : ArduinoJson v6, WebSockets by Markus Sattler
-// Fixed pins : RELAY 26 | LED 2 | GPS_RX 16 | GPS_TX 17
-// Fixed ports: UDP field 8888 | HTTP 80 | WS 81
+// Board  : KinCony ALR  (ESP32-S3-WROOM-1U N16R8)
+//          Arduino IDE → ESP32S3 Dev Module
+//          Flash 16 MB | PSRAM OPI | USB-CDC on Boot: Enabled
+//
+// Libraries (Sketch → Manage Libraries):
+//   ArduinoJson      v6   by Benoit Blanchon
+//   WebSockets           by Markus Sattler
+//   Adafruit SSD1306     by Adafruit
+//   Adafruit GFX         by Adafruit
+//
+// Fixed pins : RELAY 48 | OLED SDA 39 | OLED SCL 38
+// Fixed ports: UDP GPS 9999 | UDP field 8888 | HTTP 80 | WS 81
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -15,16 +23,22 @@
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include <WebSocketsServer.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 #include <math.h>
 
 // ─── Fixed hardware ───────────────────────────────────────────────────────────
-#define RELAY_PIN       26
-#define LED_PIN          2
-#define GPS_RX_PIN      16
-#define GPS_TX_PIN      17
-#define UDP_FIELD_PORT  8888
-#define WS_PORT         81
-#define ARM_DISTANCE_M  0.5f
+#define RELAY_PIN       48    // KinCony ALR on-board relay, active HIGH
+#define OLED_SDA        39
+#define OLED_SCL        38
+#define OLED_ADDR       0x3C
+#define OLED_W          128
+#define OLED_H           64
+#define UDP_GPS_PORT    9999  // AgIO $GNGGA/$GNRMC broadcast
+#define UDP_FIELD_PORT  8888  // sender.py JSON field data
+#define WS_PORT           81
+#define ARM_DISTANCE_M   0.5f
 
 // ─── First-boot defaults ──────────────────────────────────────────────────────
 #define DEF_SSID         "AgOpenGPS"
@@ -172,8 +186,11 @@ char    lastMarkStr[48] = "--";
 
 // ─── Objects ──────────────────────────────────────────────────────────────────
 WebServer        httpServer(80);
+WiFiUDP          gpsUdp;
 WiFiUDP          fieldUdp;
 WebSocketsServer wsServer(WS_PORT);
+Adafruit_SSD1306 oled(OLED_W, OLED_H, &Wire, -1);
+bool             oledOk = false;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  UTM CONVERSION (WGS84)
@@ -271,11 +288,21 @@ void buildGridFromABLines() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  OLED HELPER
+// ═══════════════════════════════════════════════════════════════════════════════
+void oledShow(const char *line1, const char *line2 = "", const char *line3 = "") {
+    if (!oledOk) return;
+    oled.clearDisplay();
+    oled.setTextSize(1); oled.setTextColor(SSD1306_WHITE);
+    oled.setCursor(0, 0);  oled.println(line1);
+    oled.setCursor(0, 16); oled.println(line2);
+    oled.setCursor(0, 32); oled.println(line3);
+    oled.display();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //  NMEA PARSING
 // ═══════════════════════════════════════════════════════════════════════════════
-static char nmeaBuf[128];
-static int  nmeaIdx = 0;
-
 static float nmeaDeg(const char *f, const char *h) {
     if (!f || strlen(f) < 3) return 0.0f;
     float r = atof(f);
@@ -310,8 +337,8 @@ void processNMEA(const char *raw) {
 
             // Shift to nozzle position using current heading
             float hRad = currentHeadingDeg * (float)M_PI / 180.0f;
-            float fwdE = sinf(hRad), fwdN = cosf(hRad);   // forward unit vector
-            float rgtE = cosf(hRad), rgtN = -sinf(hRad);  // right unit vector
+            float fwdE = sinf(hRad), fwdN = cosf(hRad);
+            float rgtE = cosf(hRad), rgtN = -sinf(hRad);
             nozzleE = antennaE - cfg.foreAftM*fwdE + cfg.lateralM*rgtE;
             nozzleN = antennaN - cfg.foreAftM*fwdN + cfg.lateralM*rgtN;
         } else {
@@ -326,17 +353,22 @@ void processNMEA(const char *raw) {
     }
 }
 
+// ─── GPS via UDP 9999 (AgIO broadcast) ───────────────────────────────────────
+// AgIO sends raw NMEA sentences as UTF-8 UDP datagrams, one sentence per packet
+// (or occasionally newline-separated within one packet).
 void readGPS() {
-    while (Serial2.available()) {
-        char c = (char)Serial2.read();
-        if (c == '\n' || c == '\r') {
-            if (nmeaIdx > 5) {
-                nmeaBuf[nmeaIdx] = '\0';
-                if (nmeaBuf[0] == '$') processNMEA(nmeaBuf);
-            }
-            nmeaIdx = 0;
-        } else if (nmeaIdx < (int)sizeof(nmeaBuf)-1) {
-            nmeaBuf[nmeaIdx++] = c;
+    static char udpBuf[256];
+    int len;
+    while ((len = gpsUdp.parsePacket()) > 0) {
+        int n = gpsUdp.read(udpBuf, sizeof(udpBuf)-1);
+        if (n <= 0) continue;
+        udpBuf[n] = '\0';
+
+        // Split on newlines in case multiple sentences arrive in one datagram
+        char *line = strtok(udpBuf, "\r\n");
+        while (line) {
+            if (line[0] == '$') processNMEA(line);
+            line = strtok(nullptr, "\r\n");
         }
     }
 }
@@ -443,6 +475,13 @@ void checkTrigger() {
 
         Serial.printf("FIRE idx=%d dist=%.3f hits=%d\n",
                       armedTreeIdx, armedMinDist, totalHits);
+
+        // OLED feedback
+        char ol1[22], ol2[22], ol3[22];
+        snprintf(ol1, sizeof(ol1), "MARK #%d", totalHits);
+        snprintf(ol2, sizeof(ol2), "E%.2f", nozzleE);
+        snprintf(ol3, sizeof(ol3), "N%.2f", nozzleN);
+        oledShow(ol1, ol2, ol3);
     }
 }
 
@@ -1007,10 +1046,19 @@ void handleReboot() {
 // ═══════════════════════════════════════════════════════════════════════════════
 void setup() {
     Serial.begin(115200);
-    Serial2.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+
+    // OLED on KinCony ALR custom I2C pins
+    Wire.begin(OLED_SDA, OLED_SCL);
+    oledOk = oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
+    if (oledOk) {
+        oled.clearDisplay();
+        oled.setTextSize(1); oled.setTextColor(SSD1306_WHITE);
+        oled.setCursor(0, 0); oled.println("TreeMarker");
+        oled.setCursor(0,16); oled.println("Starting...");
+        oled.display();
+    }
 
     pinMode(RELAY_PIN, OUTPUT); digitalWrite(RELAY_PIN, LOW);
-    pinMode(LED_PIN,   OUTPUT); digitalWrite(LED_PIN,   LOW);
 
     loadConfig();
     Serial.printf("\nTreeMarker  SSID=%s\n", cfg.wifiSSID);
@@ -1020,22 +1068,25 @@ void setup() {
     int t = 0;
     while (WiFi.status() != WL_CONNECTED && t < 40) {
         delay(500); t++;
-        digitalWrite(LED_PIN, !digitalRead(LED_PIN));
         Serial.print('.');
     }
-    digitalWrite(LED_PIN, LOW);
 
     if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("\nWiFi OK  IP=%s\n", WiFi.localIP().toString().c_str());
-        Serial.printf("Open browser: http://%s/\n", WiFi.localIP().toString().c_str());
-        Serial.printf("Live map:     http://%s/map\n", WiFi.localIP().toString().c_str());
+        String ip = WiFi.localIP().toString();
+        Serial.printf("\nWiFi OK  IP=%s\n", ip.c_str());
+        Serial.printf("Open browser: http://%s/\n",  ip.c_str());
+        Serial.printf("Live map:     http://%s/map\n", ip.c_str());
+        oledShow("TreeMarker", ip.c_str(), "Ready");
     } else {
         Serial.println("\nWiFi failed — AP mode");
         WiFi.mode(WIFI_AP);
         WiFi.softAP("TreeMarker-Setup", "setup1234");
-        Serial.printf("AP IP=%s\n", WiFi.softAPIP().toString().c_str());
+        String apIp = WiFi.softAPIP().toString();
+        Serial.printf("AP IP=%s\n", apIp.c_str());
+        oledShow("AP Mode", apIp.c_str(), "setup1234");
     }
 
+    gpsUdp.begin(UDP_GPS_PORT);
     fieldUdp.begin(UDP_FIELD_PORT);
 
     wsServer.begin();
@@ -1053,8 +1104,8 @@ void setup() {
     httpServer.on("/reboot",      HTTP_POST, handleReboot);
     httpServer.begin();
 
-    Serial.printf("HTTP port 80  WS port %d  UDP port %d\n",
-                  WS_PORT, UDP_FIELD_PORT);
+    Serial.printf("GPS UDP %d  Field UDP %d  HTTP 80  WS %d\n",
+                  UDP_GPS_PORT, UDP_FIELD_PORT, WS_PORT);
 }
 
 void loop() {
@@ -1065,10 +1116,22 @@ void loop() {
 
     // After each GPS fix: update guidance, check trigger, broadcast
     static bool prevValid = false;
-    if (gpsValid && (!prevValid || true)) {   // broadcast every fix
+    if (gpsValid) {
         calcGuidance();
         checkTrigger();
         broadcastGPS();
+
+        // Refresh OLED guidance ~2 Hz (skip if a mark was just shown)
+        static unsigned long lastOledMs = 0;
+        unsigned long now = millis();
+        if (oledOk && (now - lastOledMs) > 500) {
+            lastOledMs = now;
+            char l1[22], l2[22], l3[22];
+            snprintf(l1, sizeof(l1), "CT:%+.3fm q%d", crossTrackM, gpsQuality);
+            snprintf(l2, sizeof(l2), "Next:%.2fm", distNextMarkM >= 0 ? distNextMarkM : 0.f);
+            snprintf(l3, sizeof(l3), "Hits:%d Trees:%d", totalHits, treeCount);
+            oledShow(l1, l2, l3);
+        }
     }
     prevValid = gpsValid;
 }
