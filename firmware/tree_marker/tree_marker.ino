@@ -3,7 +3,7 @@
 //  Receives RTK position from AgOpenGPS via WiFi UDP
 //  Fires on-board relay at each tree grid intersection
 //
-//  Repo:  https://github.com/mandeepMildura/tree-marker-alr
+//  Repo:  https://github.com/hrdeepsingh-droid/Tree-Planter
 //  Board: KinCony ALR  https://www.kincony.com/esp32-lora-sx1278-gateway.html
 //  IDE:   ESP32S3 Dev Module  (esp32 by Espressif, 2.x)
 // ================================================================
@@ -30,7 +30,7 @@
 //         Two outer perimeter lines exported as AgOpenGPS
 //         TrackLines.txt (merge or stub) so autosteer tracks the
 //         surveyed DXF edges.
-#define FW_VERSION "1.5.0"
+#define FW_VERSION "1.5.1"
 
 // ================================================================
 //  COMPILED-IN DEFAULTS — overridden by Preferences after first save
@@ -111,7 +111,7 @@
 
 // ── GitHub release API ───────────────────────────────────────
 #define GH_LATEST_URL \
-  "https://api.github.com/repos/mandeepMildura/tree-marker-alr/releases/latest"
+  "https://api.github.com/repos/hrdeepsingh-droid/Tree-Planter/releases/latest"
 
 // ================================================================
 //  MUTABLE CONFIG (loaded from Preferences at boot)
