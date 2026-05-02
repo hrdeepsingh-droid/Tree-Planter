@@ -1,240 +1,133 @@
-# TreeMarker
+# Tree Marker ALR
 
-GPS-triggered relay mark-out system for precision tree planting.
-The ESP32 receives a field grid via WiFi/UDP, tracks the nozzle position in real time
-using RTK GPS, and fires a relay (dye sprayer) the instant the nozzle crosses each tree position.
+GPS-triggered relay marker for precision orchard row planting.  
+Fires an on-board relay at each tree grid intersection using RTK accuracy from an AgOpenGPS setup.
+
+**Hardware:** [KinCony ALR](https://www.kincony.com/esp32-lora-sx1278-gateway.html) (ESP32-S3 + SSD1306 OLED + relay)  
+**Position source:** AgOpenGPS / AgIO via WiFi UDP — no separate GPS needed  
+**Accuracy:** ~2–5 cm with F9P RTK  
 
 ---
 
-## Files
+## How it works
 
 ```
-TreeMarker/
-├── TreeMarker_ESP32/
-│   └── TreeMarker_ESP32.ino   ESP32 Arduino sketch
-├── send_field_data.py          Python field data sender (run on tablet/laptop)
-└── README.md
+F9P RTK GPS → AIO Teensy → UDP broadcast (port 9999) → AgIO on tablet
+                                   ↓
+                         ESP32-S3 on ALR listens on same WiFi
+                         → parses $GNGGA → checks grid → fires relay
 ```
 
+The ALR, your Windows tablet (AgIO), and AIO Teensy Ethernet all connect to the same phone hotspot in the tractor cab. No extra GPS wiring required.
+
 ---
 
-## Wiring
+## Hardware wiring
+
+| Connection | Details |
+|---|---|
+| Power | 12–24V DC to ALR terminals |
+| Relay output | ALR relay COM + NO → existing solenoid trigger circuit |
+| WiFi | Same hotspot as AgOpenGPS tablet |
+
+That's it. OLED, relay, and WiFi are all on-board.
+
+---
+
+## Setup
+
+### 1. Install Arduino IDE dependencies
+
+- Board package: **ESP32 by Espressif** — add this URL in board manager:  
+  `https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json`
+- Board: **ESP32S3 Dev Module**
+- Libraries (Sketch → Manage Libraries):
+  - `PubSubClient`
+  - `Adafruit SSD1306`
+  - `Adafruit GFX Library`
+
+### 2. Edit config in `tree_marker.ino`
+
+```cpp
+const char* WIFI_SSID     = "YourHotspotName";
+const char* WIFI_PASSWORD = "YourPassword";
+const char* MQTT_HOST     = "your-id.s1.eu.hivemq.cloud";
+const char* MQTT_USER     = "your-mqtt-user";
+const char* MQTT_PASS     = "your-mqtt-pass";
+
+const double ORIGIN_LAT   = -34.xxxxxx;   // First tree lat from AgOpenGPS
+const double ORIGIN_LON   =  142.xxxxxx;  // First tree lon from AgOpenGPS
+const double ROW_BEARING  =  90.0;        // AB line bearing from AgOpenGPS
+const double ROW_SPACING  =   6.7;        // Metres
+const double TREE_SPACING =   3.0;        // Metres
+const int    NUM_ROWS     =  10;
+const int    NUM_TREES    =  50;
+```
+
+### 3. Flash and test
+
+1. Connect ALR via USB-C
+2. Select **ESP32S3 Dev Module**, correct COM port
+3. Upload
+4. Open Serial Monitor (115200 baud)
+5. OLED should show WiFi IP then "Waiting for AgIO"
+6. Run AgOpenGPS simulation — drag cursor over a grid point — relay clicks
+
+---
+
+## MQTT topics
+
+| Topic | Direction | Payload |
+|---|---|---|
+| `treemarker/status` | board → you | JSON heartbeat every 30s |
+| `treemarker/hit` | board → you | `{"row":3,"tree":12,"dist":0.18,"lat":...,"lon":...}` |
+| `treemarker/ota/url` | you → board | GitHub release .bin URL |
+| `treemarker/ota/status` | board → you | `queued` / `starting` / `success` / `failed: ...` |
+| `treemarker/restart` | you → board | Any payload triggers reboot |
+
+---
+
+## OTA firmware update via MQTT
+
+1. Push a version tag to trigger a build and release:
+   ```
+   git tag v1.0.1
+   git push origin v1.0.1
+   ```
+2. Wait for GitHub Actions to finish (~3 min)
+3. Go to **Releases** → copy the `.bin` asset URL
+4. Publish the URL to `treemarker/ota/url` via your MQTT client  
+   (HiveMQ web client, MQTT Explorer, or Node-RED)
+5. Board downloads, flashes, and reboots — monitor `treemarker/ota/status`
+
+---
+
+## Grid coordinate system
 
 ```
-KinCony ALR  (ESP32-S3-WROOM-1U N16R8)
-┌──────────────────────────────────────────────────────────┐
-│  GPIO 48        ──────────────────────────  On-board relay│  active HIGH (built-in)
-│  GPIO 39 (SDA)  ──────────────────────────  OLED SDA     │  built-in SSD1306 128×64
-│  GPIO 38 (SCL)  ──────────────────────────  OLED SCL     │
-└──────────────────────────────────────────────────────────┘
-
-GPS source: AgIO broadcasts $GNGGA / $GNRMC as UDP datagrams to port 9999.
-No hardware serial wiring is needed — the ESP32 receives GPS over WiFi.
-
-Relay (on-board):
-  The KinCony ALR board has an integrated relay.
-  Wire the solenoid to the board's relay terminals (COM / NO).
-  Use a flyback diode across the solenoid coil to suppress inductive kickback.
+Tree (0,0) ─── Tree (0,1) ─── Tree (0,2) ───  ← Row 0 (ROW_BEARING direction)
+    │                                          spacing = TREE_SPACING (3.0m)
+Tree (1,0) ─── Tree (1,1) ─── Tree (1,2) ───  ← Row 1
+    │
+    ↕ ROW_SPACING (6.7m)
 ```
 
-**GPS** arrives via UDP port **9999** from AgOpenGPS AgIO — no serial cable needed.
-The sketch reads `$GNGGA` (position + fix quality) and `$GNRMC` (heading + speed).
+Origin `(ORIGIN_LAT, ORIGIN_LON)` = position of Tree (row=0, tree=0).  
+`ROW_BEARING` = compass heading your rows run (get from AgOpenGPS AB line).
 
 ---
 
-## Arduino IDE Setup
+## Tuning
 
-### 1. Add ESP32 board support
-1. **File → Preferences** → paste into *Additional Board Manager URLs*:
-   ```
-   https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
-   ```
-2. **Tools → Board → Boards Manager** → search `esp32` → install **esp32 by Espressif Systems** (v2.x)
-
-### 2. Install libraries
-Open **Sketch → Include Library → Manage Libraries** and install:
-
-| Library | Author | Version |
-|---------|--------|---------|
-| ArduinoJson | Benoit Blanchon | **6.x** (not v7) |
-| WebSockets | Markus Sattler | latest |
-| Adafruit SSD1306 | Adafruit | latest |
-| Adafruit GFX Library | Adafruit | latest |
-
-### 3. Select board settings (KinCony ALR)
-- **Tools → Board → ESP32 Arduino → ESP32S3 Dev Module**
-- **Tools → Flash Size** → 16MB
-- **Tools → PSRAM** → OPI PSRAM
-- **Tools → USB CDC on Boot** → Enabled
-- **Tools → Port** → your ESP32 COM port (VID 303A / PID 1001)
+| Setting | Default | Notes |
+|---|---|---|
+| `HIT_RADIUS` | 0.35m | Tighten to 0.15m with solid RTK fix |
+| `RELAY_PULSE_MS` | 600ms | Adjust for your solenoid / spray nozzle |
+| `COOLDOWN_MS` | 2000ms | Prevents double-trigger on same tree |
 
 ---
 
-## First Boot
+## Project context
 
-1. Create a **2.4 GHz** hotspot on your tablet:
-   - SSID: `AgOpenGPS`
-   - Password: `treeplant`
-2. Power the ESP32. The LED blinks while connecting.
-3. Open **Serial Monitor** at **115200 baud**. You will see the IP address:
-   ```
-   WiFi OK  IP=192.168.43.100
-   Open browser: http://192.168.43.100/
-   ```
-4. Open that URL in a browser on the tablet. The green settings page should load.
-5. Navigate to **WiFi** to change the network if needed.
-
-If the LED blinks 20 times and stops, WiFi failed. The ESP32 falls back to AP mode:
-- SSID: `TreeMarker-Setup` / Password: `setup1234`
-- Connect your device to that AP and open `http://192.168.4.1/`
-
----
-
-## Daily Workflow — AgOpenGPS Mode (Option 1)
-
-1. Open AgOpenGPS and create two AB lines for the field:
-   - One along the **row direction** — name it exactly `Row Direction`
-   - One along the **tree in-row direction** — name it exactly `Tree Direction`
-   - (Names must match the **AB Line Names** settings on the ESP32 page)
-2. Edit `send_field_data.py`: set `FIELD_FOLDER` to your AgOpenGPS field folder and `ESP32_IP` to the IP shown in Serial Monitor.
-3. Run `python send_field_data.py` → choose **Option 1**.
-4. The script reads `Field.txt`, `ABLines.txt`, and optionally `Boundary.txt`, then sends to the ESP32.
-5. Check the ESP32 settings page — **Trees** count should now show the grid size.
-6. Begin planting. The relay fires each time the nozzle crosses a tree position.
-7. Watch the **Live Map** page (`http://<ESP32-IP>/map`) for real-time guidance.
-
----
-
-## Daily Workflow — AutoCAD DXF Mode (Options 2 & 3)
-
-### Option 2 — Tree positions only
-1. Export your tree layout as a DXF with:
-   - `CIRCLE` entities at tree centres, and/or
-   - `LINE` / `LWPOLYLINE` / `POLYLINE` entities forming the planting grid
-2. Set `DXF_FILE` in `send_field_data.py`.
-3. Set `DXF_REAL_WORLD_COORDS = True` if the DXF is in UTM coordinates, `False` if already in local (AgOpenGPS-relative) coordinates.
-4. Run the script → choose **Option 2**. Confirm the sample points, then send.
-
-### Option 3 — Tree positions + auto-generate AB lines
-1. Same DXF requirements as Option 2.
-2. Run the script → choose **Option 3**.
-3. The script automatically detects two dominant perpendicular directions by clustering line segment angles into 1-degree bins and finding the two highest-weighted peaks. The group with larger median spacing is assigned as rows, the other as trees.
-4. It writes **`ABLines_generated.txt`** to the same folder as the DXF file.
-5. **Copy `ABLines_generated.txt` to your AgOpenGPS field folder** (the path in `FIELD_FOLDER`).
-6. In AgOpenGPS, set **Tool Width = row spacing** (printed by the script) so parallel guidance tracks generate at the correct row spacing.
-7. Then run the script → Option 1 (or the ESP32 already has the points from Option 3).
-
----
-
-## Map Page
-
-Open **`http://<ESP32-IP>/map`** in a browser on the same WiFi network.
-
-### Colour coding
-| Element | Appearance |
-|---------|-----------|
-| Current row line | Bright green horizontal line through centre |
-| Adjacent rows (±3) | Dark green horizontal lines |
-| Planned tree positions | Small white circles |
-| Already-fired marks | Filled yellow circles |
-| Nozzle position | Filled green triangle pointing in direction of travel |
-| GPS antenna position | Small grey dot |
-
-### Guidance panels (below the canvas)
-
-| Panel | Meaning |
-|-------|---------|
-| **Cross-Track** | Perpendicular distance from nozzle to the current row line. Green ≤ 0.05 m, Yellow ≤ 0.15 m, Red > 0.15 m. LEFT/RIGHT tells which side to steer. |
-| **Next Mark** | Distance along the current row to the next un-fired tree position. |
-| **Heading Error** | Deviation of actual travel heading from row direction. LEFT = steer left, RIGHT = steer right. |
-| **Speed** | Current speed in km/h from GPS. |
-| **Total Marks** | Running count of relay fires this session. |
-
-Use the cross-track panel for manual row-following: keep it green (< 5 cm) for accurate placement.
-
----
-
-## Calibration Procedure (Fore/Aft Offset)
-
-The fore/aft offset corrects for the physical distance between the GPS antenna and the spray nozzle.
-
-1. Drive slowly along one row heading approximately **north**, firing marks.
-2. Return on the **same row** heading south, firing marks on the same tree positions.
-3. Measure the distance between the north-pass mark and south-pass mark at the same tree.
-4. **Offset error = that distance ÷ 2**.
-5. Adjust **Fore/Aft (m)** on the Settings page by that amount.
-   - If the mark fires *late* (behind target) in both directions → **increase** fore/aft.
-   - Positive fore/aft = nozzle is physically behind the GPS antenna.
-6. Repeat until north and south pass marks coincide.
-
-Use the **Calibration Log** table (bottom of Settings page) for precise measurement — it shows the local easting/northing of the last 20 fire positions, so you can compare coordinates directly without a tape measure.
-
----
-
-## Uploading to ESP32
-
-1. Use a **USB data cable** (not a charge-only cable). Many phone cables are charge-only — if no COM port appears, try a different cable.
-2. Install the correct USB driver for your ESP32 board:
-   - **CP2102 chip** (most dev boards): [silabs.com/developers/usb-to-uart-bridge-vcp-drivers](https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers)
-   - **CH340 chip** (some cheap boards): [wch-ic.com/downloads](http://www.wch-ic.com/downloads/CH341SER_EXE.html)
-3. Select **Tools → Board → ESP32 Dev Module** and the correct COM port.
-4. Click **Upload** (→).
-5. **If upload fails with "Connecting…"**: hold the **BOOT button** on the ESP32 while clicking Upload, release after the upload starts.
-
----
-
-## How Minimum-Distance Triggering Works
-
-Traditional radius triggers fire as soon as the nozzle enters a circle around a tree. At speed this causes early firing because the nozzle is still approaching.
-
-TreeMarker uses **closest-point detection**:
-
-1. Every GPS fix updates the nozzle position.
-2. The nearest un-fired tree is found.
-3. When the nozzle comes within **0.5 m** of that tree, the system *arms*.
-4. While armed, the running minimum distance is tracked each fix.
-5. When the distance starts *increasing* (the nozzle has just passed the closest point), the relay fires.
-
-The spray mark therefore lands precisely at the calculated tree position regardless of speed, with no radius to tune. The only accuracy-limiting factor is the fore/aft offset calibration.
-
----
-
-## How UTM Conversion Works and Why It Matches AgOpenGPS
-
-AgOpenGPS uses **UTM (Universal Transverse Mercator)** coordinates to represent field positions. It reads a `Field.txt` file that contains the UTM zone, and easting/northing offsets. All internal positions are stored as offsets from those values, so coordinates stay small (hundreds of metres rather than millions).
-
-TreeMarker applies the same WGS84 → UTM formula using the same zone and offsets received from `send_field_data.py`. Because the math is identical, a tree position exported from AgOpenGPS and a GPS fix on the ESP32 are directly comparable in the same coordinate space.
-
-The formula handles the southern hemisphere correctly by adding **10,000,000 m** to the northing when latitude is negative (the standard false northing for southern UTM zones).
-
----
-
-## How Automatic Direction Detection Works (Option 3)
-
-1. Every `LINE`, `LWPOLYLINE`, and `POLYLINE` entity in the DXF is extracted as a set of segments.
-2. Each segment's bearing (0–180°) is calculated and added to a 1-degree histogram, weighted by segment length (longer lines have more influence).
-3. The **strongest peak** in the histogram is the dominant planting direction.
-4. The script finds the second peak that is **most perpendicular** (closest to 90° away) from the first — this is the other planting direction.
-5. For each group, segment midpoints are projected onto the perpendicular axis and clustered. The **median gap between clusters** gives the line spacing.
-6. The group with **larger spacing = rows**, smaller spacing = trees. If the two spacings are within 20% of each other the script asks the user to confirm which is which.
-7. The **longest segment** in each group becomes the reference AB line, with its start point as the origin and its bearing as the heading.
-8. The result is written to `ABLines_generated.txt` in AgOpenGPS format, ready to copy to the field folder.
-
----
-
-## Troubleshooting
-
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| No COM port in Arduino IDE | Wrong cable or missing driver | Try a different USB cable; install CP2102 or CH340 driver |
-| Upload fails "Connecting…" | Boot mode not triggered | Hold BOOT button on ESP32 during upload start |
-| Settings page won't load | Wrong IP or different network | Check Serial Monitor for IP; ensure device is on same WiFi |
-| No marks placed | No GPS fix or no grid loaded | Check Settings page GPS quality field; run `send_field_data.py` |
-| Marks at wrong position | Fore/aft offset wrong | Run bidirectional calibration; adjust Fore/Aft on Settings page |
-| Marks firing twice at same tree | Cooldown too short | Increase Cooldown on Settings page |
-| Map page blank canvas | No GPS fix yet | Drive slowly until GPS fix quality > 0 |
-| WebSocket "Connecting…" stays | Port 81 blocked | Check firewall/hotspot settings; ensure device is on same network |
-| Python: Field.txt not found | Wrong FIELD_FOLDER path | Edit `FIELD_FOLDER` at top of `send_field_data.py` |
-| Python: ezdxf not found | Library missing | Run `pip install ezdxf` |
-| AB lines mode: 0 trees built | Name mismatch | Check AB Line Names on Settings page; names are case-sensitive |
-| Option 3: ambiguous spacings | Grid has equal row/tree spacing | Script will prompt; choose which direction is rows |
+Part of the [AquaControl / Sunraysia Acres](https://github.com/mandeepMildura) precision ag toolkit.  
+Mildura / Sunraysia region, Victoria, Australia.

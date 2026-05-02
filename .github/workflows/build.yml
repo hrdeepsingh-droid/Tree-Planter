@@ -1,0 +1,79 @@
+name: Build firmware
+
+# Triggers:
+#   - Push a tag like v1.0.1  →  builds .bin and creates a GitHub Release
+#   - Every push to main      →  build-only (no release), confirms it compiles
+
+on:
+  push:
+    branches: [ main ]
+    tags:     [ 'v*.*.*' ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install arduino-cli
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh \
+            | BINDIR="$HOME/bin" sh
+          echo "$HOME/bin" >> $GITHUB_PATH
+
+      - name: Add ESP32 board index
+        run: |
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls \
+            https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+
+      - name: Install ESP32 core
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@2.0.17
+
+      - name: Install libraries
+        run: |
+          arduino-cli lib install "PubSubClient"
+          arduino-cli lib install "Adafruit SSD1306"
+          arduino-cli lib install "Adafruit GFX Library"
+
+      - name: Build firmware
+        run: |
+          arduino-cli compile \
+            --fqbn "esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,FlashSize=16M,PSRAM=opi" \
+            --output-dir build \
+            firmware/tree_marker/tree_marker.ino
+          ls -lh build/
+
+      - name: Upload build artifact (every push)
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ github.sha }}
+          path: build/tree_marker.ino.bin
+
+      - name: Create GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Firmware ${{ github.ref_name }}"
+          body: |
+            ## Tree Marker Firmware ${{ github.ref_name }}
+
+            ### OTA update via MQTT
+            1. Copy the `.bin` asset URL below
+            2. Publish it to MQTT topic `treemarker/ota/url`
+            3. Board downloads, flashes, and reboots automatically
+            4. Monitor `treemarker/ota/status` for progress
+
+            ### Changes
+            <!-- Add release notes here -->
+          files: build/tree_marker.ino.bin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
