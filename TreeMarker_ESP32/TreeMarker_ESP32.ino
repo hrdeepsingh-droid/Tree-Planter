@@ -22,7 +22,7 @@
 #define LED_PIN          2
 #define GPS_RX_PIN      16
 #define GPS_TX_PIN      17
-#define UDP_FIELD_PORT  8899
+#define UDP_FIELD_PORT  8888
 #define WS_PORT         81
 #define ARM_DISTANCE_M  0.5f
 

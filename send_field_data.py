@@ -21,7 +21,7 @@ from collections import defaultdict
 FIELD_FOLDER          = "C:/AgOpenGPS/Fields/MyField"
 DXF_FILE              = "C:/CAD/tree_layout.dxf"
 ESP32_IP              = "192.168.43.100"
-ESP32_PORT            = 8899
+ESP32_PORT            = 8888
 INCLUDE_BOUNDARY      = True
 DXF_REAL_WORLD_COORDS = True    # True = DXF in UTM coords, False = already local
 DUPLICATE_TOLERANCE_M = 0.05    # metres for point deduplication
