@@ -40,6 +40,15 @@
 //         group as "rows" (orchard convention). Detection telemetry
 //         (bearings, spacings, kept/total counts) is returned in the
 //         /field/dxf JSON response and surfaced in the upload status pane.
+// 1.5.7 — /api/grid: switched from one giant Arduino String to chunked
+//         HTTP transfer (sendContent against a 4 KB scratch buffer).
+//         At ~32 K points the v1.5.6 String corrupted its own prefix
+//         and left binary nulls scattered through the body — confirmed
+//         by curling the device: response started with `{"mode",[...`
+//         (the `:N,"rows":N,"trees":N,"points":[` prefix was gone) and
+//         the tail was riddled with \0 between closing brackets, breaking
+//         JSON.parse with "Expected ':' at position 7". Streaming chunks
+//         keeps heap flat and the response is byte-exact JSON.
 // 1.5.6 — /api/grid was building one Arduino String containing every
 //         intersection (~32 bytes/point), which at 32K points = ~1 MB
 //         vs ~200 KB free heap → OOM/truncation, blank map. Capped the
@@ -75,7 +84,7 @@
 //         as grid" that switches source and scrolls to the upload card;
 //         (5) numIntersections / gNumRows / gNumTrees are zeroed on every
 //         /field/apply so old dots don't bleed through after a mode swap.
-#define FW_VERSION "1.5.6"
+#define FW_VERSION "1.5.7"
 
 // ================================================================
 //  COMPILED-IN DEFAULTS — overridden by Preferences after first save
@@ -3260,33 +3269,42 @@ void handleDxfRaw() {
   f.close();
 }
 
-// GET /api/grid — planned tree positions as lat/lon, either from
-// the Simple grid[][] or from intersections[] in AB mode. Designed
-// for the dashboard Map tab to plot without needing its own maths.
-// v1.5.6: response is capped to GRID_DISPLAY_CAP points with stride
-// sampling when intersections exceed it. Hit detection still uses the
-// full intersections[] array — only the visualization is sampled.
-// Reason: at 32K trees × ~30 bytes per point = ~1 MB, building the
-// JSON in a single Arduino String thrashes the ~200 KB free heap and
-// the response either OOMs or truncates, leaving the map blank.
+// GET /api/grid — planned tree positions as lat/lon, either from the
+// Simple grid[][] or from intersections[] in AB mode. Designed for the
+// dashboard Map tab to plot without needing its own maths.
+//
+// v1.5.7: response is built as HTTP/1.1 chunked transfer using
+// sendContent() against a small reusable 4 KB scratch buffer. v1.5.6
+// still aggregated everything in one Arduino String, which corrupted
+// the response prefix and left binary nulls scattered through the body
+// once the String exceeded ~64 KB (heap fragmentation + concat realloc
+// race). Streaming chunks keeps heap usage flat regardless of point
+// count, and the response is byte-exact JSON the browser can parse.
+//
+// Display is capped to GRID_DISPLAY_CAP points with stride sampling
+// when intersections[] exceeds it. Hit detection still uses the full
+// intersections[] array — only the visualization is sampled.
 #define GRID_DISPLAY_CAP 4000
 void handleGrid() {
-  String out;
-  out.reserve(32768);
-  char head[96];
-  snprintf(head, sizeof(head),
+  webServer.sendHeader("Access-Control-Allow-Origin", "*");
+  webServer.sendHeader("Cache-Control", "no-cache");
+  webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  webServer.send(200, "application/json", "");
+
+  static char chunk[4096];
+  int pos = 0;
+
+  // Prefix
+  pos = snprintf(chunk, sizeof(chunk),
     "{\"mode\":%d,\"rows\":%d,\"trees\":%d,\"points\":[",
     gGridMode, gNumRows, gNumTrees);
-  out += head;
+  webServer.sendContent(chunk, pos);
+  pos = 0;
 
   bool first = true;
-  char buf[72];
+  // Auto-flush when remaining chunk space is less than one max-sized point.
+  const int FLUSH_HEADROOM = 80;
 
-  // v1.5.4: gate on intersections[] having data, not on gHasLines —
-  // gHasLines is false for DXF source (no AB-line recipe), so the old
-  // condition silently skipped DXF-derived trees and fell through to
-  // the empty simple-mode grid. The map saw zero dots despite the
-  // firmware having a full intersections array.
   if (gGridMode == MODE_AB && gHasField && numIntersections > 0) {
     int treesPerRow = (gNumTrees > 0) ? gNumTrees : 1;
     int stride = (numIntersections > GRID_DISPLAY_CAP)
@@ -3297,72 +3315,81 @@ void handleGrid() {
       localToLatLon(intersections[i].e, intersections[i].n, lat, lon);
       int r = i / treesPerRow;
       int t = i % treesPerRow;
-      int n = snprintf(buf, sizeof(buf), "%s[%.7f,%.7f,%d,%d]",
-                       first ? "" : ",", lat, lon, r, t);
-      out.concat(buf, n);
+      if (pos > (int)sizeof(chunk) - FLUSH_HEADROOM) {
+        webServer.sendContent(chunk, pos); pos = 0;
+      }
+      pos += snprintf(chunk + pos, sizeof(chunk) - pos,
+                      "%s[%.7f,%.7f,%d,%d]",
+                      first ? "" : ",", lat, lon, r, t);
       first = false;
     }
   } else {
     for (int r = 0; r < gNumRows; r++) {
       for (int t = 0; t < gNumTrees; t++) {
-        int n = snprintf(buf, sizeof(buf), "%s[%.7f,%.7f,%d,%d]",
-                         first ? "" : ",", grid[r][t].lat, grid[r][t].lon, r, t);
-        out.concat(buf, n);
+        if (pos > (int)sizeof(chunk) - FLUSH_HEADROOM) {
+          webServer.sendContent(chunk, pos); pos = 0;
+        }
+        pos += snprintf(chunk + pos, sizeof(chunk) - pos,
+                        "%s[%.7f,%.7f,%d,%d]",
+                        first ? "" : ",", grid[r][t].lat, grid[r][t].lon, r, t);
         first = false;
       }
     }
   }
+  if (pos > 0) { webServer.sendContent(chunk, pos); pos = 0; }
 
-  out += "]";
+  webServer.sendContent("],\"boundary\":[");
 
-  // Optional boundary polygon (AB mode only)
-  out += ",\"boundary\":[";
   if (gGridMode == MODE_AB && gHasField && gHasBoundary) {
     for (int i = 0; i < numBoundary; i++) {
       double lat, lon;
       localToLatLon(boundary[i].e, boundary[i].n, lat, lon);
-      int n = snprintf(buf, sizeof(buf), "%s[%.7f,%.7f]",
-                       i ? "," : "", lat, lon);
-      out.concat(buf, n);
+      if (pos > (int)sizeof(chunk) - FLUSH_HEADROOM) {
+        webServer.sendContent(chunk, pos); pos = 0;
+      }
+      pos += snprintf(chunk + pos, sizeof(chunk) - pos,
+                      "%s[%.7f,%.7f]",
+                      i ? "," : "", lat, lon);
     }
+    if (pos > 0) { webServer.sendContent(chunk, pos); pos = 0; }
   }
-  out += "]";
 
   // AB-line segments so the dashboard can overlay them on the map and
   // the user can see whether the Row/Tree lines match the actual trees.
   // Each segment starts ~one spacing-unit before the grid origin and
   // extends one spacing-unit beyond the last tree/row for visibility.
-  auto writeAbSeg = [&](double dE, double dN, double extent) {
+  webServer.sendContent("],\"rowLine\":[");
+  if (gGridMode == MODE_AB && gHasLines && gHasField) {
+    double rowHdgR = gRowHdg * M_PI / 180.0;
+    double dE = sin(rowHdgR), dN = cos(rowHdgR);
+    double extent = (double)(gNumTrees > 1 ? gNumTrees - 1 : 1) * gTreeSpacing;
     double pad = (extent < 10.0) ? 10.0 : extent * 0.1;
-    double aE = gAbOriginE - pad * dE;
-    double aN = gAbOriginN - pad * dN;
-    double bE = gAbOriginE + (extent + pad) * dE;
-    double bN = gAbOriginN + (extent + pad) * dN;
+    double aE = gAbOriginE - pad * dE, aN = gAbOriginN - pad * dN;
+    double bE = gAbOriginE + (extent + pad) * dE, bN = gAbOriginN + (extent + pad) * dN;
     double lat1, lon1, lat2, lon2;
     localToLatLon(aE, aN, lat1, lon1);
     localToLatLon(bE, bN, lat2, lon2);
-    char seg[160];
-    int n = snprintf(seg, sizeof(seg), "[%.7f,%.7f],[%.7f,%.7f]",
-                     lat1, lon1, lat2, lon2);
-    out.concat(seg, n);
-  };
-  out += ",\"rowLine\":[";
-  if (gGridMode == MODE_AB && gHasLines && gHasField) {
-    double rowHdgR = gRowHdg * M_PI / 180.0;
-    writeAbSeg(sin(rowHdgR), cos(rowHdgR),
-               (double)(gNumTrees > 1 ? gNumTrees - 1 : 1) * gTreeSpacing);
+    pos = snprintf(chunk, sizeof(chunk), "[%.7f,%.7f],[%.7f,%.7f]",
+                   lat1, lon1, lat2, lon2);
+    webServer.sendContent(chunk, pos); pos = 0;
   }
-  out += "],\"treeLine\":[";
+  webServer.sendContent("],\"treeLine\":[");
   if (gGridMode == MODE_AB && gHasLines && gHasField) {
     double treeHdgR = gTreeHdg * M_PI / 180.0;
-    writeAbSeg(sin(treeHdgR), cos(treeHdgR),
-               (double)(gNumRows > 1 ? gNumRows - 1 : 1) * gRowSpacing);
+    double dE = sin(treeHdgR), dN = cos(treeHdgR);
+    double extent = (double)(gNumRows > 1 ? gNumRows - 1 : 1) * gRowSpacing;
+    double pad = (extent < 10.0) ? 10.0 : extent * 0.1;
+    double aE = gAbOriginE - pad * dE, aN = gAbOriginN - pad * dN;
+    double bE = gAbOriginE + (extent + pad) * dE, bN = gAbOriginN + (extent + pad) * dN;
+    double lat1, lon1, lat2, lon2;
+    localToLatLon(aE, aN, lat1, lon1);
+    localToLatLon(bE, bN, lat2, lon2);
+    pos = snprintf(chunk, sizeof(chunk), "[%.7f,%.7f],[%.7f,%.7f]",
+                   lat1, lon1, lat2, lon2);
+    webServer.sendContent(chunk, pos); pos = 0;
   }
-  out += "]}";
-
-  webServer.sendHeader("Access-Control-Allow-Origin", "*");
-  webServer.sendHeader("Cache-Control", "no-cache");
-  webServer.send(200, "application/json", out);
+  webServer.sendContent("]}");
+  webServer.sendContent("");  // end of chunked transfer
 }
 
 // GET /api/hits — last 20 fires, newest first. Supports ?csv=1 for
