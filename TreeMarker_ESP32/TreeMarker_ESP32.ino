@@ -1,7 +1,7 @@
 // TreeMarker_ESP32.ino
 // GPS-triggered relay mark-out system for tree planting.
 // Receives field grid data via UDP (port 8888), tracks RTK nozzle position
-// via AgIO GPS broadcast (UDP 9999), fires relay when nozzle passes each tree.
+// via AgOpenGPS PGN binary on UDP 8888, fires relay when nozzle passes each tree.
 //
 // Board  : KinCony ALR  (ESP32-S3-WROOM-1U N16R8)
 //          Arduino IDE → ESP32S3 Dev Module
@@ -14,7 +14,7 @@
 //   Adafruit GFX         by Adafruit
 //
 // Fixed pins : RELAY 48 | OLED SDA 39 | OLED SCL 38
-// Fixed ports: UDP GPS 9999 | UDP field 8888 | HTTP 80 | WS 81
+// Fixed ports: UDP 8888 (GPS PGN + field JSON) | HTTP 80 | WS 81
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -35,10 +35,12 @@
 #define OLED_ADDR       0x3C
 #define OLED_W          128
 #define OLED_H           64
-#define UDP_GPS_PORT    9999  // AgIO $GNGGA/$GNRMC broadcast
-#define UDP_FIELD_PORT  8888  // sender.py JSON field data
+#define UDP_PORT        8888  // all traffic: AgIO PGN binary + sender.py JSON
 #define WS_PORT           81
 #define ARM_DISTANCE_M   0.5f
+
+// AgOpenGPS PGN IDs
+#define PGN_GPS   229   // 0xE5  GPS position/heading/speed from AgIO
 
 // ─── First-boot defaults ──────────────────────────────────────────────────────
 #define DEF_SSID         "AgOpenGPS"
@@ -186,8 +188,7 @@ char    lastMarkStr[48] = "--";
 
 // ─── Objects ──────────────────────────────────────────────────────────────────
 WebServer        httpServer(80);
-WiFiUDP          gpsUdp;
-WiFiUDP          fieldUdp;
+WiFiUDP          udp;              // single socket on UDP_PORT 8888
 WebSocketsServer wsServer(WS_PORT);
 Adafruit_SSD1306 oled(OLED_W, OLED_H, &Wire, -1);
 bool             oledOk = false;
@@ -301,75 +302,66 @@ void oledShow(const char *line1, const char *line2 = "", const char *line3 = "")
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  NMEA PARSING
+//  AgOpenGPS PGN DECODER
+//
+//  AgIO broadcasts binary PGN packets to 255.255.255.255:8888.
+//  Packet structure:
+//    [0]  0x80  preamble
+//    [1]  0x81  preamble
+//    [2]  src   source module ID (0x7F = AgIO)
+//    [3]  pgn   PGN number
+//    [4]  len   number of data bytes that follow (NOT counting CRC)
+//    [5..5+len-1]  data
+//    [5+len]  CRC = XOR of all data bytes
+//
+//  PGN 229 (0xE5) — GPS position/heading/speed from AgIO:
+//    data[0..3]  int32  latitude  * 1e7  (little-endian)
+//    data[4..7]  int32  longitude * 1e7  (little-endian)
+//    data[8..9]  uint16 speed_kmh * 10   (little-endian)
+//    data[10..11] uint16 heading_deg * 10 (little-endian)
+//    data[12]    uint8  fix quality (0=none, 1=GPS, 2=DGPS, 4=RTK, 5=float)
+//    data[13]    uint8  satellite count
+//    data[14]    uint8  HDOP * 10
 // ═══════════════════════════════════════════════════════════════════════════════
-static float nmeaDeg(const char *f, const char *h) {
-    if (!f || strlen(f) < 3) return 0.0f;
-    float r = atof(f);
-    int   d = (int)(r / 100.0f);
-    float v = d + (r - d*100.0f) / 60.0f;
-    if (h[0]=='S' || h[0]=='W') v = -v;
-    return v;
+static inline int32_t le32s(const uint8_t *b) {
+    return (int32_t)(b[0] | (b[1]<<8) | (b[2]<<16) | ((uint32_t)b[3]<<24));
+}
+static inline uint16_t le16u(const uint8_t *b) {
+    return (uint16_t)(b[0] | (b[1]<<8));
 }
 
-void processNMEA(const char *raw) {
-    static char buf[128];
-    strncpy(buf, raw, sizeof(buf)-1);
-    buf[sizeof(buf)-1] = '\0';
-    char *star = strrchr(buf, '*');
-    if (star) *star = '\0';
+void parsePGN229(const uint8_t *buf, int len) {
+    // Need header(5) + 15 data bytes + 1 CRC = 21 bytes minimum
+    if (len < 21) return;
+    const uint8_t *d = buf + 5;   // data starts at byte 5
 
-    char *f[22]; int fc = 0;
-    char *tok = strtok(buf, ",");
-    while (tok && fc < 22) { f[fc++] = tok; tok = strtok(nullptr, ","); }
-    if (fc < 2) return;
+    int32_t  lat32  = le32s(d + 0);
+    int32_t  lon32  = le32s(d + 4);
+    uint16_t spd16  = le16u(d + 8);    // km/h * 10
+    uint16_t hdg16  = le16u(d + 10);   // degrees * 10
+    uint8_t  fixQ   = d[12];
 
-    if (strstr(f[0], "GGA") && fc >= 7) {
-        int q = atoi(f[6]);
-        if (q > 0) {
-            gpsQuality = q;
-            gpsLat     = nmeaDeg(f[2], f[3]);
-            gpsLon     = nmeaDeg(f[4], f[5]);
-            gpsValid   = true;
+    Serial.printf("PGN229 lat=%d lon=%d spd=%u hdg=%u fix=%u\n",
+                  lat32, lon32, spd16, hdg16, fixQ);
 
-            // Convert to local coords
-            latLonToLocal(gpsLat, gpsLon, antennaE, antennaN);
+    if (fixQ > 0) {
+        gpsLat  = lat32 / 1e7;
+        gpsLon  = lon32 / 1e7;
+        currentSpeedMS    = (spd16 / 10.0f) / 3.6f;   // km/h → m/s
+        currentHeadingDeg = hdg16 / 10.0f;
+        gpsQuality = (int)fixQ;
+        gpsValid   = true;
 
-            // Shift to nozzle position using current heading
-            float hRad = currentHeadingDeg * (float)M_PI / 180.0f;
-            float fwdE = sinf(hRad), fwdN = cosf(hRad);
-            float rgtE = cosf(hRad), rgtN = -sinf(hRad);
-            nozzleE = antennaE - cfg.foreAftM*fwdE + cfg.lateralM*rgtE;
-            nozzleN = antennaN - cfg.foreAftM*fwdN + cfg.lateralM*rgtN;
-        } else {
-            gpsValid = false;
-        }
+        latLonToLocal(gpsLat, gpsLon, antennaE, antennaN);
 
-    } else if (strstr(f[0], "RMC") && fc >= 9) {
-        if (f[2][0] == 'A') {
-            currentSpeedMS    = atof(f[7]) * 0.51444f;
-            currentHeadingDeg = atof(f[8]);
-        }
-    }
-}
-
-// ─── GPS via UDP 9999 (AgIO broadcast) ───────────────────────────────────────
-// AgIO sends raw NMEA sentences as UTF-8 UDP datagrams, one sentence per packet
-// (or occasionally newline-separated within one packet).
-void readGPS() {
-    static char udpBuf[256];
-    int len;
-    while ((len = gpsUdp.parsePacket()) > 0) {
-        int n = gpsUdp.read(udpBuf, sizeof(udpBuf)-1);
-        if (n <= 0) continue;
-        udpBuf[n] = '\0';
-
-        // Split on newlines in case multiple sentences arrive in one datagram
-        char *line = strtok(udpBuf, "\r\n");
-        while (line) {
-            if (line[0] == '$') processNMEA(line);
-            line = strtok(nullptr, "\r\n");
-        }
+        float hRad = currentHeadingDeg * (float)M_PI / 180.0f;
+        float fwdE = sinf(hRad), fwdN = cosf(hRad);
+        float rgtE = cosf(hRad), rgtN = -sinf(hRad);
+        nozzleE = antennaE - cfg.foreAftM*fwdE + cfg.lateralM*rgtE;
+        nozzleN = antennaN - cfg.foreAftM*fwdN + cfg.lateralM*rgtN;
+    } else {
+        gpsValid   = false;
+        gpsQuality = 0;
     }
 }
 
@@ -516,107 +508,119 @@ void broadcastGPS() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  UDP FIELD DATA
+//  UNIFIED UDP HANDLER  (port 8888)
+//  Receives both AgOpenGPS binary PGN packets and sender.py JSON field data.
+//  Detection:
+//    first byte 0x80 → AgOpenGPS binary PGN
+//    first byte '{'  → JSON from sender.py
 // ═══════════════════════════════════════════════════════════════════════════════
-void processFieldUDP() {
-    int len = fieldUdp.parsePacket();
-    if (len <= 0) return;
+void processUDP() {
+    static uint8_t buf[8192];
+    int len;
+    while ((len = udp.parsePacket()) > 0) {
+        int n = udp.read(buf, sizeof(buf)-1);
+        if (n <= 0) continue;
+        buf[n] = '\0';
 
-    static char buf[8192];
-    int n = fieldUdp.read(buf, sizeof(buf)-1);
-    if (n <= 0) return;
-    buf[n] = '\0';
-
-    DynamicJsonDocument doc(8192);
-    if (deserializeJson(doc, buf) != DeserializationError::Ok) {
-        Serial.println("UDP JSON parse error");
-        return;
-    }
-
-    // Field UTM reference
-    if (doc.containsKey("fieldZone")) {
-        fieldZone     = doc["fieldZone"]     | 0;
-        fieldEasting  = doc["fieldEasting"]  | 0.0;
-        fieldNorthing = doc["fieldNorthing"] | 0.0;
-        Serial.printf("Field UTM zone=%d  E=%.1f  N=%.1f\n",
-                      fieldZone, fieldEasting, fieldNorthing);
-    }
-
-    const char *mode = doc["mode"] | "";
-
-    // ── AB lines ──────────────────────────────────────────────────────────────
-    if (strcmp(mode, "ablines") == 0) {
-        abLineCount = 0;
-        for (JsonObject ln : doc["allLines"].as<JsonArray>()) {
-            if (abLineCount >= MAX_ABLINES) break;
-            strlcpy(abLines[abLineCount].name, ln["name"] | "", 64);
-            abLines[abLineCount].headingDeg = ln["heading"]  | 0.0f;
-            abLines[abLineCount].easting    = ln["easting"]  | 0.0f;
-            abLines[abLineCount].northing   = ln["northing"] | 0.0f;
-            abLineCount++;
+        // ── AgOpenGPS binary PGN ─────────────────────────────────────────────
+        if (n >= 5 && buf[0] == 0x80 && buf[1] == 0x81) {
+            uint8_t pgn = buf[3];
+            if (pgn == PGN_GPS) parsePGN229(buf, n);
+            // other PGNs ignored for now
+            continue;
         }
-        Serial.printf("AB lines received: %d\n", abLineCount);
 
-        boundaryCount = 0;
-        if (doc.containsKey("boundary")) {
-            for (JsonObject pt : doc["boundary"].as<JsonArray>()) {
-                if (boundaryCount >= MAX_BOUNDARY) break;
-                boundary[boundaryCount++] = {pt["e"]|0.0f, pt["n"]|0.0f};
+        // ── JSON from sender.py ──────────────────────────────────────────────
+        if (buf[0] != '{') continue;
+
+        DynamicJsonDocument doc(8192);
+        if (deserializeJson(doc, (char *)buf) != DeserializationError::Ok) {
+            Serial.println("UDP JSON parse error");
+            continue;
+        }
+
+        // Field UTM reference (sent with every packet from sender.py)
+        if (doc.containsKey("fieldZone")) {
+            fieldZone     = doc["fieldZone"]     | 0;
+            fieldEasting  = doc["fieldEasting"]  | 0.0;
+            fieldNorthing = doc["fieldNorthing"] | 0.0;
+            Serial.printf("Field UTM zone=%d  E=%.1f  N=%.1f\n",
+                          fieldZone, fieldEasting, fieldNorthing);
+        }
+
+        const char *mode = doc["mode"] | "";
+
+        // ── AB lines ─────────────────────────────────────────────────────────
+        if (strcmp(mode, "ablines") == 0) {
+            abLineCount = 0;
+            for (JsonObject ln : doc["allLines"].as<JsonArray>()) {
+                if (abLineCount >= MAX_ABLINES) break;
+                strlcpy(abLines[abLineCount].name, ln["name"] | "", 64);
+                abLines[abLineCount].headingDeg = ln["heading"]  | 0.0f;
+                abLines[abLineCount].easting    = ln["easting"]  | 0.0f;
+                abLines[abLineCount].northing   = ln["northing"] | 0.0f;
+                abLineCount++;
+            }
+            Serial.printf("AB lines received: %d\n", abLineCount);
+
+            boundaryCount = 0;
+            if (doc.containsKey("boundary")) {
+                for (JsonObject pt : doc["boundary"].as<JsonArray>()) {
+                    if (boundaryCount >= MAX_BOUNDARY) break;
+                    boundary[boundaryCount++] = {pt["e"]|0.0f, pt["n"]|0.0f};
+                }
+            }
+            buildGridFromABLines();
+
+        // ── Points (chunked) ──────────────────────────────────────────────────
+        } else if (strcmp(mode, "points") == 0) {
+            // Header packet: has totalChunks/totalPoints but no chunkIdx key
+            if (!doc.containsKey("chunkIdx")) {
+                chunkTotalChunks = doc["totalChunks"] | 1;
+                chunkTotalPoints = doc["totalPoints"] | 0;
+                chunkGotCount    = 0;
+                chunkActive      = true;
+                memset(chunkReceived, 0, sizeof(chunkReceived));
+                treeCount = 0;
+                memset(treeFired, 0, sizeof(treeFired));
+                Serial.printf("Points header: %d chunks, %d pts\n",
+                              chunkTotalChunks, chunkTotalPoints);
+                continue;
+            }
+
+            int ci = doc["chunkIdx"] | 0;
+            int tc = doc["totalChunks"] | 1;
+
+            if (!chunkActive || chunkTotalChunks != tc) {
+                chunkTotalChunks = tc;
+                chunkTotalPoints = doc["totalPoints"] | 0;
+                chunkGotCount    = 0;
+                chunkActive      = true;
+                memset(chunkReceived, 0, sizeof(chunkReceived));
+                treeCount = 0;
+                memset(treeFired, 0, sizeof(treeFired));
+            }
+
+            if (ci >= 0 && ci < MAX_CHUNKS && !chunkReceived[ci]) {
+                chunkReceived[ci] = true;
+                chunkGotCount++;
+                int base = ci * CHUNK_SIZE;
+                for (JsonObject pt : doc["points"].as<JsonArray>()) {
+                    if (base >= MAX_TREES) break;
+                    trees[base++] = {pt["e"]|0.0f, pt["n"]|0.0f};
+                }
+                if (base > treeCount) treeCount = base;
+            }
+
+            if (chunkGotCount >= chunkTotalChunks) {
+                treeCount   = min(chunkTotalPoints, MAX_TREES);
+                chunkActive = false;
+                gridReady   = true;
+                sourceMode  = "AutoCAD DXF";
+                Serial.printf("Points complete: %d trees\n", treeCount);
             }
         }
-        buildGridFromABLines();
-
-    // ── Points (chunked or single) ────────────────────────────────────────────
-    } else if (strcmp(mode, "points") == 0) {
-        // Header packet: has totalChunks/totalPoints but no chunkIdx key
-        if (!doc.containsKey("chunkIdx")) {
-            chunkTotalChunks = doc["totalChunks"] | 1;
-            chunkTotalPoints = doc["totalPoints"] | 0;
-            chunkGotCount    = 0;
-            chunkActive      = true;
-            memset(chunkReceived, 0, sizeof(chunkReceived));
-            treeCount = 0;
-            memset(treeFired, 0, sizeof(treeFired));
-            Serial.printf("Points header: %d chunks, %d pts\n",
-                          chunkTotalChunks, chunkTotalPoints);
-            return;
-        }
-
-        int ci = doc["chunkIdx"] | 0;
-        int tc = doc["totalChunks"] | 1;
-
-        if (!chunkActive || chunkTotalChunks != tc) {
-            // Single-packet or no header received
-            chunkTotalChunks = tc;
-            chunkTotalPoints = doc["totalPoints"] | 0;
-            chunkGotCount    = 0;
-            chunkActive      = true;
-            memset(chunkReceived, 0, sizeof(chunkReceived));
-            treeCount = 0;
-            memset(treeFired, 0, sizeof(treeFired));
-        }
-
-        if (ci >= 0 && ci < MAX_CHUNKS && !chunkReceived[ci]) {
-            chunkReceived[ci] = true;
-            chunkGotCount++;
-            int base = ci * CHUNK_SIZE;
-            for (JsonObject pt : doc["points"].as<JsonArray>()) {
-                if (base >= MAX_TREES) break;
-                trees[base++] = {pt["e"]|0.0f, pt["n"]|0.0f};
-            }
-            if (base > treeCount) treeCount = base;
-        }
-
-        if (chunkGotCount >= chunkTotalChunks) {
-            treeCount  = min(chunkTotalPoints, MAX_TREES);
-            chunkActive = false;
-            gridReady   = true;
-            sourceMode  = "AutoCAD DXF";
-            // No AB line data in points mode; guidance needs at least a heading
-            // Use activeRowHeadingDeg as-is (0 until user sets via settings)
-            Serial.printf("Points complete: %d trees\n", treeCount);
-        }
-    }
+    }   // end while parsePacket
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1086,8 +1090,7 @@ void setup() {
         oledShow("AP Mode", apIp.c_str(), "setup1234");
     }
 
-    gpsUdp.begin(UDP_GPS_PORT);
-    fieldUdp.begin(UDP_FIELD_PORT);
+    udp.begin(UDP_PORT);   // single socket: receives AgIO PGN + sender.py JSON
 
     wsServer.begin();
     wsServer.onEvent(webSocketEvent);
@@ -1104,15 +1107,14 @@ void setup() {
     httpServer.on("/reboot",      HTTP_POST, handleReboot);
     httpServer.begin();
 
-    Serial.printf("GPS UDP %d  Field UDP %d  HTTP 80  WS %d\n",
-                  UDP_GPS_PORT, UDP_FIELD_PORT, WS_PORT);
+    Serial.printf("UDP port %d (GPS PGN + field JSON)  HTTP 80  WS %d\n",
+                  UDP_PORT, WS_PORT);
 }
 
 void loop() {
     httpServer.handleClient();
     wsServer.loop();
-    processFieldUDP();
-    readGPS();
+    processUDP();   // handles both AgIO PGN binary (GPS) and sender.py JSON
 
     // After each GPS fix: update guidance, check trigger, broadcast
     static bool prevValid = false;
