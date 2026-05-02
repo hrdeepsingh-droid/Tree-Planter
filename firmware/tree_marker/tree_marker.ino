@@ -40,7 +40,22 @@
 //         group as "rows" (orchard convention). Detection telemetry
 //         (bearings, spacings, kept/total counts) is returned in the
 //         /field/dxf JSON response and surfaced in the upload status pane.
-#define FW_VERSION "1.5.2"
+// 1.5.3 — DXF fixes from real-world test: (1) bearing centroid now uses
+//         circular mean on doubled angle (sum of cos 2θ / sin 2θ), so
+//         clusters straddling the 0°/180° wrap collapse instead of being
+//         pulled to ~90° (was producing trees=1 @ 69° in v1.5.2);
+//         (2) parsed DXF coordinates are re-framed at upload by projecting
+//         the anchor lat/lon to its UTM/MGA zone and subtracting from
+//         every segment, so intersections[], hit detection, TrackLines.txt
+//         export, and the map preview all share the same local frame as
+//         GPS-derived position; (3) /field/apply accepts source="dxf" or
+//         source="ablines" and reloads the DXF NVS cache when switching
+//         back to DXF; saveAbPrefs no longer auto-removes the cache when
+//         source flips; (4) field UI gets a third button "Use DXF file
+//         as grid" that switches source and scrolls to the upload card;
+//         (5) numIntersections / gNumRows / gNumTrees are zeroed on every
+//         /field/apply so old dots don't bleed through after a mode swap.
+#define FW_VERSION "1.5.3"
 
 // ================================================================
 //  COMPILED-IN DEFAULTS — overridden by Preferences after first save
@@ -334,9 +349,12 @@ void saveAbPrefs() {
       Serial.printf("[DXF] NVS cache truncated: wrote %u of %u bytes\n",
                     (unsigned)wrote, (unsigned)want);
     }
-  } else if (gGridSource != SRC_DXF) {
-    prefs.remove("dxf_pts");
   }
+  // v1.5.3: do NOT remove dxf_pts when source != SRC_DXF. The "Use DXF
+  // mode" button (and any future re-selection) needs the cache to stick
+  // around so we can reload after the user temporarily switches to AB
+  // or Simple. The cache is only ever overwritten by the next successful
+  // DXF upload.
 
   prefs.end();
 }
@@ -609,6 +627,7 @@ main{max-width:920px;margin:0 auto;padding:22px 20px 48px}
     <div class=dvd></div>
     <button class="btn btn-p" onclick=setMode(1)><span>Use AB mode (from AgOpenGPS)</span><span class=bi>&rarr;</span></button>
     <button class="btn btn-g" onclick=setMode(0)><span>Use Simple mode (origin + bearing)</span><span class=bi>&rarr;</span></button>
+    <button class="btn btn-g" onclick=useDxfMode()><span>Use DXF file as grid</span><span class=bi>&rarr;</span></button>
   </div>
   <div class=card>
     <div class=clbl>Upload from AgOpenGPS Field Folder</div>
@@ -1011,8 +1030,17 @@ var applyLines=()=>{
 };
 var setMode=(m)=>{
   fetch('/field/apply',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({mode:m})})
+    body:JSON.stringify({mode:m,source:'ablines'})})
     .then(r=>r.json()).then(d=>{fetchField();poll();refreshMapGrid();});
+};
+var useDxfMode=()=>{
+  fetch('/field/apply',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({mode:1,source:'dxf'})})
+    .then(r=>r.json()).then(d=>{
+      fetchField();poll();refreshMapGrid();
+      var fileInput=document.getElementById('fd-dxf');
+      if(fileInput) fileInput.scrollIntoView({behavior:'smooth',block:'center'});
+    });
 };
 var _formFilled=false;
 var fillForm=(c)=>{
@@ -2026,20 +2054,37 @@ static void classifyDxfLines() {
     return;
   }
 
-  // 5. Centroid-refine each bearing within ±2° windows
-  double sumA = 0; int cntA0 = 0;
-  double sumB = 0; int cntB0 = 0;
+  // 5. Centroid-refine each bearing within ±2° windows. Use a circular
+  //    mean on the doubled angle (2θ): bearings on opposite sides of the
+  //    0°/180° wrap (e.g. 179° and 1°) are physically the same direction
+  //    but their arithmetic mean is ~90°, which is what blew up v1.5.2.
+  //    Doubling the angle collapses the wrap; halving the result restores
+  //    bearing in [0,180).
+  double sxA = 0, cxA = 0; int cntA0 = 0;
+  double sxB = 0, cxB = 0; int cntB0 = 0;
   for (int i = 0; i < gDxfLineCount; i++) {
     const DxfLine& L = gDxfLines[i];
-    int bi = (int)(bearingMod180(L.x1, L.y1, L.x2, L.y2) + 0.5f);
-    if (bi >= 180) bi = 0;
+    float br = bearingMod180(L.x1, L.y1, L.x2, L.y2);
+    int bi = (int)(br + 0.5f); if (bi >= 180) bi = 0;
     int dA = abs(bi - pA); if (dA > 90) dA = 180 - dA;
     int dB = abs(bi - pB); if (dB > 90) dB = 180 - dB;
-    if (dA <= 2) { sumA += bi; cntA0++; }
-    if (dB <= 2) { sumB += bi; cntB0++; }
+    double th2 = 2.0 * (double)br * M_PI / 180.0;
+    if (dA <= 2) { sxA += sin(th2); cxA += cos(th2); cntA0++; }
+    if (dB <= 2) { sxB += sin(th2); cxB += cos(th2); cntB0++; }
   }
-  float bA = (cntA0 > 0) ? (float)(sumA / cntA0) : (float)pA;
-  float bB = (cntB0 > 0) ? (float)(sumB / cntB0) : (float)pB;
+  float bA = (float)pA, bB = (float)pB;
+  if (cntA0 > 0) {
+    double m = atan2(sxA, cxA) * 0.5 * 180.0 / M_PI;
+    while (m < 0)      m += 180.0;
+    while (m >= 180.0) m -= 180.0;
+    bA = (float)m;
+  }
+  if (cntB0 > 0) {
+    double m = atan2(sxB, cxB) * 0.5 * 180.0 / M_PI;
+    while (m < 0)      m += 180.0;
+    while (m >= 180.0) m -= 180.0;
+    bB = (float)m;
+  }
 
   // 6. Two-pass classify into temp buffers (PSRAM-friendly).
   int* tA = (int*)ps_malloc(sizeof(int) * MAX_DXF_LINES);
@@ -2872,28 +2917,49 @@ void handleFieldUpload() {
                 gAnchorLat, gAnchorLon, numIntersections, numBoundary);
 }
 
-// POST /field/apply — {"rowName":"Row","treeName":"Tree","mode":1}
-// Re-picks active lines by name and toggles mode. Intersections rebuild.
+// POST /field/apply — {"rowName":"Row","treeName":"Tree","mode":1,"source":"dxf"}
+// Re-picks active lines by name, toggles mode, and (v1.5.3) optionally
+// switches grid source. Intersections always cleared first, then
+// repopulated from the right backing store.
 void handleFieldApply() {
   if (webServer.method() != HTTP_POST) {
     webServer.send(405, "text/plain", "POST only"); return;
   }
   String body = webServer.arg("plain");
-  String rn = jsonStr(body, "rowName");
-  String tn = jsonStr(body, "treeName");
+  String rn  = jsonStr(body, "rowName");
+  String tn  = jsonStr(body, "treeName");
+  String src = jsonStr(body, "source");
   int newMode = (int)jsonFloat(body, "mode");
   if (rn.length() > 0) strlcpy(gRowLineName,  rn.c_str(), sizeof(gRowLineName));
   if (tn.length() > 0) strlcpy(gTreeLineName, tn.c_str(), sizeof(gTreeLineName));
   if (newMode == MODE_SIMPLE || newMode == MODE_AB) gGridMode = newMode;
+  if      (src == "dxf")     gGridSource = SRC_DXF;
+  else if (src == "ablines") gGridSource = SRC_ABLINES;
+
+  // v1.5.3: always reset visible grid state at the top so a stale
+  // intersections[] from a prior session never bleeds through after a
+  // mode or source change. Each branch below re-populates as appropriate.
+  numIntersections = 0;
+  lastRawIntersections = 0;
+  gNumRows = gNumTrees = 0;
 
   if (gGridSource == SRC_DXF) {
-    // DXF source: intersections[] is already cached; don't touch it
-    // beyond clearing when the user switches back to SIMPLE mode.
-    if (gGridMode == MODE_SIMPLE) numIntersections = 0;
+    // Reload the DXF intersection cache that was written to NVS at the
+    // last successful /field/dxf upload. If no DXF has been uploaded
+    // yet, intersections stays 0 and the user is invited to upload one.
+    if (gGridMode == MODE_AB) {
+      prefs.begin("tm", true);
+      size_t want = prefs.getBytesLength("dxf_pts");
+      if (want > 0 && want <= sizeof(intersections)) {
+        prefs.getBytes("dxf_pts", intersections, want);
+        numIntersections = want / sizeof(IPt);
+        lastRawIntersections = numIntersections;
+      }
+      prefs.end();
+    }
   } else {
     resolveActiveABLines();
     if (gGridMode == MODE_AB && gHasLines) buildAbIntersections();
-    else                                   numIntersections = 0;
   }
   saveAbPrefs();
 
@@ -3055,6 +3121,30 @@ void handleDxfUploadEnd() {
     return;
   }
   gAnchorLat = aLat; gAnchorLon = aLon; gHasField = true;
+
+  // v1.5.3: Re-frame the parsed DXF segments. CAD output is normally in
+  // projected metres (UTM/MGA easting/northing, e.g. 626219.750,
+  // 6183177.000 in zone 54 for Sunraysia), but everything downstream —
+  // intersections[], hit detection vs GPS-derived local frame, the
+  // TrackLines.txt export, the map preview — assumes coordinates in
+  // metres relative to the StartFix anchor. Without this conversion,
+  // intersection coordinates land ~6 million metres off, the relay
+  // never fires, and AOG draws TrackLines off-screen. Project the
+  // anchor to MGA in its UTM zone and subtract from every segment.
+  {
+    int zone = (int)floor((gAnchorLon + 180.0) / 6.0) + 1;
+    double anchorE = 0, anchorN = 0;
+    latLonToUTM(gAnchorLat, gAnchorLon, zone, anchorE, anchorN);
+    Serial.printf("[DXF] re-framing %d segments: zone=%d anchorMGA=(%.2f,%.2f)\n",
+                  gDxfLineCount, zone, anchorE, anchorN);
+    for (int i = 0; i < gDxfLineCount; i++) {
+      DxfLine& L = gDxfLines[i];
+      L.x1 = (float)((double)L.x1 - anchorE);
+      L.y1 = (float)((double)L.y1 - anchorN);
+      L.x2 = (float)((double)L.x2 - anchorE);
+      L.y2 = (float)((double)L.y2 - anchorN);
+    }
+  }
 
   // Classify (auto-detect two perpendicular bearings), build intersections,
   // pick outer edges.
