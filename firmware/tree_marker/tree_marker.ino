@@ -21,9 +21,16 @@
 #include <Update.h>
 #include <HTTPClient.h>
 #include <DNSServer.h>
+#include <LittleFS.h>
 
 // ── Firmware version (bumped on each release) ─────────────────
-#define FW_VERSION "1.4.12"
+// 1.5.0 — DXF tree-grid upload: new /field/dxf endpoint parses LINE
+//         entities, computes intersections, drives MODE_AB. Manual
+//         anchor lat/lon supported as an alternative to AOG Field.txt.
+//         Two outer perimeter lines exported as AgOpenGPS
+//         TrackLines.txt (merge or stub) so autosteer tracks the
+//         surveyed DXF edges.
+#define FW_VERSION "1.5.0"
 
 // ================================================================
 //  COMPILED-IN DEFAULTS — overridden by Preferences after first save
@@ -52,11 +59,25 @@
 
 // ── Grid mode ─────────────────────────────────────────────────
 #define MODE_SIMPLE  0      // origin + bearing + spacings (bench/sim)
-#define MODE_AB      1      // cross-AB lines imported from AgOpenGPS
+#define MODE_AB      1      // intersections[] grid (from AOG ABLines or DXF)
+
+// Which source populated intersections[]. MODE_AB is the fire-detection
+// mode; SRC_* distinguishes how the grid was built so boot can skip
+// buildAbIntersections() when the source is DXF (no AB lines to resolve).
+#define SRC_ABLINES  0
+#define SRC_DXF      1
 
 // Default AB-line names (match whatever you saved in AgOpenGPS)
 #define DEF_ROW_NAME   "Row"
 #define DEF_TREE_NAME  "Tree"
+
+// Default DXF layer names for classifying LINE entities
+#define DEF_ROW_LAYER  "Row"
+#define DEF_TREE_LAYER "Tree"
+
+// Default names for the two perimeter lines exported to TrackLines.txt
+#define DEF_EDGE_ROW   "DXF-Row-Edge"
+#define DEF_EDGE_TREE  "DXF-Tree-Edge"
 
 // Max intersections we pre-compute and store in RAM.
 // 2000 × 8 bytes = 16KB — comfortable on ESP32-S3.
@@ -137,6 +158,27 @@ double gAbOriginN = 0;            // set by resolveActiveABLines()
 // re-uploading. Persisted in NVS as "ab_raw" (<=3800 chars).
 String gAbLinesRaw;
 
+// ── DXF-mode state ────────────────────────────────────────────
+// intersections[] may be populated from AOG ABLines (SRC_ABLINES) or
+// from a DXF upload (SRC_DXF). The layer names are how we classify
+// LINE entities inside the DXF; the edge names are how we tag the
+// two outer perimeter lines that get exported to TrackLines.txt.
+int  gGridSource = SRC_ABLINES;
+char gRowLayer[24];
+char gTreeLayer[24];
+char gEdgeRowName[32];
+char gEdgeTreeName[32];
+// Generated TrackLines.txt content (merged or stubbed) — kept in
+// NVS so the user can re-download without re-uploading the DXF.
+String gTrackLinesOut;
+// Outer row/tree perimeter line geometry (local E/N metres). Populated
+// by pickOuterDxfLines() on each successful DXF upload. Heading is
+// degrees in the AOG convention (0°=N, 90°=E, clockwise).
+float  gEdgeRowX1 = 0, gEdgeRowY1 = 0, gEdgeRowX2 = 0, gEdgeRowY2 = 0;
+float  gEdgeTreeX1 = 0, gEdgeTreeY1 = 0, gEdgeTreeX2 = 0, gEdgeTreeY2 = 0;
+float  gEdgeRowHdg = 0, gEdgeTreeHdg = 0;
+bool   gHasEdges = false;
+
 // AB-mode geometry (declared up here so loadPrefs can populate them).
 struct IPt { float e; float n; };
 IPt  intersections[MAX_INTERSECTIONS];
@@ -198,6 +240,33 @@ void loadPrefs() {
       gHasBoundary = false;
     }
   }
+
+  // DXF-mode state
+  gGridSource = prefs.getInt("grid_src", SRC_ABLINES);
+  strlcpy(gRowLayer,     prefs.getString("row_lyr",   DEF_ROW_LAYER ).c_str(), sizeof(gRowLayer));
+  strlcpy(gTreeLayer,    prefs.getString("tree_lyr",  DEF_TREE_LAYER).c_str(), sizeof(gTreeLayer));
+  strlcpy(gEdgeRowName,  prefs.getString("edge_row",  DEF_EDGE_ROW ).c_str(),  sizeof(gEdgeRowName));
+  strlcpy(gEdgeTreeName, prefs.getString("edge_tree", DEF_EDGE_TREE).c_str(),  sizeof(gEdgeTreeName));
+  gTrackLinesOut = prefs.getString("trk_export", "");
+  gHasEdges      = prefs.getBool(  "has_edges", false);
+  gEdgeRowX1  = prefs.getFloat("erx1", 0);  gEdgeRowY1  = prefs.getFloat("ery1", 0);
+  gEdgeRowX2  = prefs.getFloat("erx2", 0);  gEdgeRowY2  = prefs.getFloat("ery2", 0);
+  gEdgeTreeX1 = prefs.getFloat("etx1", 0);  gEdgeTreeY1 = prefs.getFloat("ety1", 0);
+  gEdgeTreeX2 = prefs.getFloat("etx2", 0);  gEdgeTreeY2 = prefs.getFloat("ety2", 0);
+  gEdgeRowHdg = prefs.getFloat("erhdg", 0); gEdgeTreeHdg = prefs.getFloat("ethdg", 0);
+  // When the grid source is DXF, intersections[] isn't rebuilt from
+  // AB-line geometry — it's loaded straight from this cache.
+  numIntersections = 0;
+  lastRawIntersections = 0;
+  if (gGridSource == SRC_DXF) {
+    size_t want = prefs.getBytesLength("dxf_pts");
+    if (want > 0 && want <= sizeof(intersections)) {
+      prefs.getBytes("dxf_pts", intersections, want);
+      numIntersections = want / sizeof(IPt);
+      lastRawIntersections = numIntersections;
+    }
+  }
+
   prefs.end();
 }
 
@@ -229,6 +298,36 @@ void saveAbPrefs() {
   } else {
     prefs.remove("bnd_pts");
   }
+
+  // DXF-mode state
+  prefs.putInt(   "grid_src",  gGridSource);
+  prefs.putString("row_lyr",   gRowLayer);
+  prefs.putString("tree_lyr",  gTreeLayer);
+  prefs.putString("edge_row",  gEdgeRowName);
+  prefs.putString("edge_tree", gEdgeTreeName);
+  // TrackLines.txt is small for two lines; guard against huge merged files.
+  String t = gTrackLinesOut;
+  if (t.length() > 3800) t = t.substring(0, 3800);
+  prefs.putString("trk_export", t);
+  prefs.putBool(  "has_edges", gHasEdges);
+  prefs.putFloat("erx1", gEdgeRowX1);  prefs.putFloat("ery1", gEdgeRowY1);
+  prefs.putFloat("erx2", gEdgeRowX2);  prefs.putFloat("ery2", gEdgeRowY2);
+  prefs.putFloat("etx1", gEdgeTreeX1); prefs.putFloat("ety1", gEdgeTreeY1);
+  prefs.putFloat("etx2", gEdgeTreeX2); prefs.putFloat("ety2", gEdgeTreeY2);
+  prefs.putFloat("erhdg", gEdgeRowHdg);
+  prefs.putFloat("ethdg", gEdgeTreeHdg);
+  if (gGridSource == SRC_DXF && numIntersections > 0) {
+    size_t want = numIntersections * sizeof(IPt);
+    size_t wrote = prefs.putBytes("dxf_pts", intersections, want);
+    if (wrote != want) {
+      // NVS partition too small for the full grid — cache whatever fits.
+      Serial.printf("[DXF] NVS cache truncated: wrote %u of %u bytes\n",
+                    (unsigned)wrote, (unsigned)want);
+    }
+  } else if (gGridSource != SRC_DXF) {
+    prefs.remove("dxf_pts");
+  }
+
   prefs.end();
 }
 
@@ -510,6 +609,34 @@ main{max-width:920px;margin:0 auto;padding:22px 20px 48px}
     <p class=note id=fd-status>Save two AB lines in AgOpenGPS (one row direction, one tree direction), plus optionally the field boundary. Copy ABLines.txt, Field.txt, and Boundary.txt from your field folder and drop them here.</p>
   </div>
   <div class=card>
+    <div class=clbl>Upload DXF Tree Grid</div>
+    <div class=fg><label>Tree grid DXF (.dxf)</label><input id=fd-dxf type=file accept=".dxf"></div>
+    <div class=fg>
+      <label>Anchor source</label>
+      <div style="display:flex;gap:14px;font-weight:500;font-size:13px;color:var(--tx)">
+        <label><input type=radio name=anchSrc value=field checked onchange=dxfAnchorChange()> From AOG Field.txt</label>
+        <label><input type=radio name=anchSrc value=manual onchange=dxfAnchorChange()> Manual lat/lon</label>
+      </div>
+    </div>
+    <div id=dxf-anch-field class=fg><label>Field.txt (for anchor)</label><input id=fd-dxf-ft type=file accept=".txt"></div>
+    <div id=dxf-anch-manual class=g2 style="display:none">
+      <div class=fg><label>Anchor Latitude</label><input id=fd-alat type=number step=0.0000001 placeholder="-34.3166591"></div>
+      <div class=fg><label>Anchor Longitude</label><input id=fd-alon type=number step=0.0000001 placeholder="142.1562539"></div>
+    </div>
+    <div class=g2>
+      <div class=fg><label>Row Layer Name</label><input id=fd-rlyr type=text value=Row></div>
+      <div class=fg><label>Tree Layer Name</label><input id=fd-tlyr type=text value=Tree></div>
+    </div>
+    <div class=g2>
+      <div class=fg><label>Outer-row line name</label><input id=fd-erow type=text value=DXF-Row-Edge></div>
+      <div class=fg><label>Outer-tree line name</label><input id=fd-etree type=text value=DXF-Tree-Edge></div>
+    </div>
+    <div class=fg><label>Existing TrackLines.txt <span style="color:var(--mu);font-weight:400;text-transform:none;letter-spacing:0">(optional &mdash; merge into)</span></label><input id=fd-trk type=file accept=".txt"></div>
+    <button class="btn btn-p" onclick=dxfUpload()><span>Upload DXF &amp; Apply</span><span class=bi>&#8593;</span></button>
+    <button class="btn btn-g" id=fd-dl-trk onclick=downloadTracklines() disabled><span>Download TrackLines.txt</span><span class=bi>&#8659;</span></button>
+    <p class=note id=fd-dxf-status>Draw row and tree LINE entities on layers named Row / Tree. Trees are the pairwise intersections.</p>
+  </div>
+  <div class=card>
     <div class=clbl>Active Line Names</div>
     <div class=g2>
       <div class=fg><label>Row Line Name</label><input id=fd-rname type=text></div>
@@ -738,7 +865,15 @@ var fetchHits=()=>{
 };
 var fetchField=()=>{
   fetch('/field/state').then(r=>r.json()).then(d=>{
-    document.getElementById('fd-mode').textContent=d.mode===1?'AB (from AOG)':'Simple (origin+bearing)';
+    var modeLbl;
+    if(d.mode===1)modeLbl=(d.source===1?'AB (from DXF)':'AB (from AOG)');
+    else modeLbl='Simple (origin+bearing)';
+    document.getElementById('fd-mode').textContent=modeLbl;
+    if(d.rowLayer)document.getElementById('fd-rlyr').value=d.rowLayer;
+    if(d.treeLayer)document.getElementById('fd-tlyr').value=d.treeLayer;
+    if(d.edgeRow)document.getElementById('fd-erow').value=d.edgeRow;
+    if(d.edgeTree)document.getElementById('fd-etree').value=d.edgeTree;
+    document.getElementById('fd-dl-trk').disabled=!(d.trackBytes>0);
     var nlbl=d.hasBoundary&&d.rawIntersections>d.intersections
       ?(d.intersections+' ('+d.rawIntersections+' before boundary clip)')
       :(''+d.intersections);
@@ -789,6 +924,64 @@ var fieldUpload=async ()=>{
         if(d.detail) st.textContent+=' — got: '+d.detail;
       }
     }).catch(e=>{st.style.color='var(--er)';st.textContent='Upload failed: '+e;});
+};
+var dxfAnchorChange=()=>{
+  var v=document.querySelector('input[name=anchSrc]:checked').value;
+  document.getElementById('dxf-anch-field').style.display =(v=='field')?'':'none';
+  document.getElementById('dxf-anch-manual').style.display=(v=='manual')?'':'none';
+};
+var dxfUpload=async ()=>{
+  var st=document.getElementById('fd-dxf-status');
+  var dxf=document.getElementById('fd-dxf').files[0];
+  if(!dxf){alert('Pick a DXF file');return;}
+  var src=document.querySelector('input[name=anchSrc]:checked').value;
+  var qs='anchorSrc='+encodeURIComponent(src);
+  var fd=new FormData();
+  fd.append('dxf',dxf);
+  if(src=='manual'){
+    var la=document.getElementById('fd-alat').value.trim();
+    var lo=document.getElementById('fd-alon').value.trim();
+    if(!la||!lo){alert('Fill anchor lat and lon');return;}
+    qs+='&lat='+encodeURIComponent(la)+'&lon='+encodeURIComponent(lo);
+  } else {
+    var ft=document.getElementById('fd-dxf-ft').files[0];
+    if(!ft){alert('Pick Field.txt (or switch to Manual)');return;}
+    fd.append('field',ft);
+  }
+  var rl=document.getElementById('fd-rlyr').value.trim();
+  var tl=document.getElementById('fd-tlyr').value.trim();
+  var er=document.getElementById('fd-erow').value.trim();
+  var et=document.getElementById('fd-etree').value.trim();
+  if(rl)qs+='&rowLayer='+encodeURIComponent(rl);
+  if(tl)qs+='&treeLayer='+encodeURIComponent(tl);
+  if(er)qs+='&edgeRow='+encodeURIComponent(er);
+  if(et)qs+='&edgeTree='+encodeURIComponent(et);
+  var trk=document.getElementById('fd-trk').files[0];
+  if(trk)fd.append('tracklines',trk);
+  st.style.color='';
+  st.textContent='Uploading...';
+  try{
+    var r=await fetch('/field/dxf?'+qs,{method:'POST',body:fd});
+    var txt=await r.text();
+    var d; try{d=JSON.parse(txt);}catch(e){d={ok:false,error:txt||('HTTP '+r.status)};}
+    if(d.ok){
+      var msg=d.intersections+' intersections ('+d.rowLines+' rows × '+d.treeLines+' trees)';
+      if(d.overflow)msg+=' — OVERFLOW, some skipped';
+      msg+='. Anchor '+d.field.anchorLat.toFixed(7)+','+d.field.anchorLon.toFixed(7);
+      msg+='. Edges: '+d.edge.row+' ('+d.edge.rowHdg.toFixed(1)+'°), '+d.edge.tree+' ('+d.edge.treeHdg.toFixed(1)+'°).';
+      msg+=' TrackLines '+(d.tracklinesMerged?'merged':'stub')+' ('+d.trackBytes+' bytes).';
+      st.textContent=msg;
+      document.getElementById('fd-dl-trk').disabled=false;
+      fetchField();poll();refreshMapGrid();
+    } else {
+      st.style.color='var(--er)';
+      st.textContent='Upload failed: '+(d.error||'unknown error');
+      if(d.detail)st.textContent+=' — '+d.detail;
+    }
+  }catch(e){st.style.color='var(--er)';st.textContent='Upload failed: '+e;}
+};
+var downloadTracklines=()=>{
+  window.location='/field/tracklines/download';
 };
 var applyLines=()=>{
   var rn=document.getElementById('fd-rname').value.trim();
@@ -1520,6 +1713,367 @@ bool pointInBoundary(double e, double n) {
   return inside;
 }
 
+// ================================================================
+//  DXF TREE GRID IMPORT
+//  Stream-parse ASCII DXF uploads; extract LINE entities on the
+//  Row / Tree layers; compute pairwise intersections; pick the two
+//  outermost perimeter lines for export to AgOpenGPS TrackLines.txt.
+// ================================================================
+
+// One LINE entity extracted from the DXF. Layer truncated to 23 chars.
+struct DxfLine { float x1,y1,x2,y2; char layer[24]; };
+
+// Parsed lines live in PSRAM while an upload is being processed;
+// they're freed once intersections have been built.
+#define MAX_DXF_LINES 4000
+static DxfLine* gDxfLines    = nullptr;
+static int      gDxfLineCap  = 0;
+static int      gDxfLineCount = 0;
+static int      gDxfBadLines = 0;
+static bool     gDxfBinaryRejected = false;
+
+// Stream parser. DXF ASCII is pairs of lines: (group-code, value).
+// Chunks from the HTTP upload callback may split a line anywhere, so
+// we buffer the partial tail between feed() calls.
+struct DxfParser {
+  String tail;
+  int    code;             // last group code seen (-1 = waiting for code)
+  bool   waitingForValue;  // true after reading a code, before its value
+  bool   inLine;           // true between "0 LINE" and the next "0 ..."
+  float  x1,y1,x2,y2;
+  bool   hasX1,hasY1,hasX2,hasY2;
+  char   layer[24];
+
+  void reset() {
+    tail = "";
+    code = -1;
+    waitingForValue = false;
+    resetEntity();
+  }
+  void resetEntity() {
+    inLine = false;
+    hasX1 = hasY1 = hasX2 = hasY2 = false;
+    x1 = y1 = x2 = y2 = 0;
+    layer[0] = '\0';
+  }
+  // Flush the current in-progress entity. Only LINE entities with all
+  // four endpoint coordinates present are pushed; anything else is
+  // counted as a "bad line" but not an error.
+  void flushEntity() {
+    if (inLine) {
+      if (hasX1 && hasY1 && hasX2 && hasY2 && gDxfLineCount < gDxfLineCap) {
+        DxfLine& l = gDxfLines[gDxfLineCount++];
+        l.x1 = x1; l.y1 = y1; l.x2 = x2; l.y2 = y2;
+        strlcpy(l.layer, layer, sizeof(l.layer));
+      } else if (inLine) {
+        gDxfBadLines++;
+      }
+    }
+    resetEntity();
+  }
+  void handlePair(int c, const String& v) {
+    String val = v; val.trim();
+    if (c == 0) {
+      // Entity terminator — flush previous, then check if this starts a new LINE
+      flushEntity();
+      if (val == "LINE") {
+        inLine = true;
+      }
+    } else if (!inLine) {
+      // Inside header/tables/blocks section — ignore codes outside LINEs.
+    } else if (c == 8) {
+      strlcpy(layer, val.c_str(), sizeof(layer));
+    } else if (c == 10) { x1 = val.toFloat(); hasX1 = true; }
+    else if (c == 20) { y1 = val.toFloat(); hasY1 = true; }
+    else if (c == 11) { x2 = val.toFloat(); hasX2 = true; }
+    else if (c == 21) { y2 = val.toFloat(); hasY2 = true; }
+    // other codes ignored
+  }
+  void feed(const uint8_t* buf, size_t n) {
+    if (n == 0) return;
+    // Check the first bytes once for binary DXF sentinel
+    if (!gDxfBinaryRejected && tail.length() == 0 && code == -1) {
+      // Binary DXF starts with "AutoCAD Binary DXF\r\n\x1a\0"
+      if (n >= 18 && memcmp(buf, "AutoCAD Binary DXF", 18) == 0) {
+        gDxfBinaryRejected = true;
+        return;
+      }
+    }
+    // Append new bytes to whatever tail we saved from last chunk
+    tail.reserve(tail.length() + n + 1);
+    for (size_t i = 0; i < n; i++) {
+      char ch = (char)buf[i];
+      if (ch == '\r') continue;          // normalise CRLF
+      if (ch == '\n') {
+        String line = tail; tail = "";
+        line.trim();
+        if (waitingForValue) {
+          handlePair(code, line);
+          waitingForValue = false;
+          code = -1;
+        } else if (line.length() > 0) {
+          code = line.toInt();
+          waitingForValue = true;
+        }
+      } else {
+        tail += ch;
+      }
+    }
+  }
+  // Called after the last chunk. Flush the final in-flight entity.
+  void finish() {
+    if (tail.length() > 0) {
+      String line = tail; line.trim();
+      if (waitingForValue) handlePair(code, line);
+      tail = "";
+      waitingForValue = false;
+      code = -1;
+    }
+    flushEntity();
+  }
+};
+static DxfParser gDxfParser;
+
+// Case-insensitive layer match. DXF conventions often upper-case
+// layer names; the UI defaults them to "Row" / "Tree" but we don't
+// want the user stuck on exact case.
+static bool layerMatch(const char* got, const char* want) {
+  while (*got && *want) {
+    char a = *got; char b = *want;
+    if (a >= 'A' && a <= 'Z') a += 32;
+    if (b >= 'A' && b <= 'Z') b += 32;
+    if (a != b) return false;
+    got++; want++;
+  }
+  return *got == 0 && *want == 0;
+}
+
+// Row / tree line index arrays, filled by classifyDxfLines().
+static int  gRowIdx[MAX_DXF_LINES];
+static int  gTreeIdx[MAX_DXF_LINES];
+static int  gRowCount = 0, gTreeCount = 0;
+
+static void classifyDxfLines() {
+  gRowCount = 0;
+  gTreeCount = 0;
+  for (int i = 0; i < gDxfLineCount; i++) {
+    if      (layerMatch(gDxfLines[i].layer, gRowLayer)  && gRowCount  < MAX_DXF_LINES) gRowIdx[gRowCount++]   = i;
+    else if (layerMatch(gDxfLines[i].layer, gTreeLayer) && gTreeCount < MAX_DXF_LINES) gTreeIdx[gTreeCount++] = i;
+  }
+}
+
+// Line-heading in AOG convention (0°=N, 90°=E, clockwise). DXF uses
+// a standard Cartesian frame (x=E, y=N), so heading = atan2(dx, dy).
+static float lineHeadingDeg(float x1, float y1, float x2, float y2) {
+  double dx = x2 - x1, dy = y2 - y1;
+  double h = atan2(dx, dy) * 180.0 / M_PI;
+  if (h < 0) h += 360.0;
+  return (float)h;
+}
+
+// Pairwise intersection of row-layer × tree-layer lines. Uses parametric
+// line-line solve; results outside both segment bounds (± 0.1 m
+// tolerance, normalised to segment length) are rejected. Replaces
+// intersections[] in-place and returns overflow flag.
+static bool buildDxfIntersections() {
+  numIntersections = 0;
+  lastRawIntersections = 0;
+  bool overflow = false;
+  for (int ri = 0; ri < gRowCount; ri++) {
+    const DxfLine& R = gDxfLines[gRowIdx[ri]];
+    double rDx = R.x2 - R.x1, rDy = R.y2 - R.y1;
+    double rLen = sqrt(rDx*rDx + rDy*rDy);
+    if (rLen < 1e-6) continue;
+    for (int ti = 0; ti < gTreeCount; ti++) {
+      const DxfLine& T = gDxfLines[gTreeIdx[ti]];
+      double tDx = T.x2 - T.x1, tDy = T.y2 - T.y1;
+      double tLen = sqrt(tDx*tDx + tDy*tDy);
+      if (tLen < 1e-6) continue;
+      double denom = rDx * tDy - rDy * tDx;
+      if (fabs(denom) < 1e-9) continue;  // parallel
+      double sx = T.x1 - R.x1;
+      double sy = T.y1 - R.y1;
+      double u = (sx * tDy - sy * tDx) / denom;  // along row
+      double v = (sx * rDy - sy * rDx) / denom;  // along tree
+      double tolR = 0.1 / rLen;
+      double tolT = 0.1 / tLen;
+      if (u < -tolR || u > 1.0 + tolR) continue;
+      if (v < -tolT || v > 1.0 + tolT) continue;
+      double iE = R.x1 + u * rDx;
+      double iN = R.y1 + u * rDy;
+      lastRawIntersections++;
+      if (gHasBoundary && !pointInBoundary(iE, iN)) continue;
+      if (numIntersections >= MAX_INTERSECTIONS) { overflow = true; continue; }
+      intersections[numIntersections].e = (float)iE;
+      intersections[numIntersections].n = (float)iN;
+      numIntersections++;
+    }
+  }
+  // For AB-mode indexing (row = i/gNumTrees, tree = i%gNumTrees) the
+  // dashboard needs gNumRows/gNumTrees set. Use the classified counts.
+  if (gTreeCount > 0) {
+    gNumRows  = gRowCount;
+    gNumTrees = gTreeCount;
+    if (gNumRows  > 20)  gNumRows  = 20;
+    if (gNumTrees > 100) gNumTrees = 100;
+  }
+  Serial.printf("[DXF] Built %d intersections (%d rows × %d trees, raw=%d, overflow=%d)\n",
+                numIntersections, gRowCount, gTreeCount, lastRawIntersections, overflow ? 1 : 0);
+  return overflow;
+}
+
+// Pick the two outermost perimeter lines. "Outermost" = the row line
+// whose midpoint has the largest absolute projection onto the tree-
+// direction normal (and vice versa). The tree-direction is taken as
+// the average heading of all tree-layer lines, so this works even
+// when the grid is rotated.
+static void pickOuterDxfLines() {
+  gHasEdges = false;
+  if (gRowCount == 0 || gTreeCount == 0) return;
+
+  // Mean heading (unit vector) of each group, using doubled-angle
+  // averaging so opposite-pointing lines don't cancel out.
+  double rowSx = 0, rowCx = 0;
+  for (int i = 0; i < gRowCount; i++) {
+    const DxfLine& L = gDxfLines[gRowIdx[i]];
+    double a = atan2((double)(L.y2 - L.y1), (double)(L.x2 - L.x1)) * 2.0;
+    rowSx += sin(a); rowCx += cos(a);
+  }
+  double rowMean = atan2(rowSx, rowCx) / 2.0;
+  double rowUx = cos(rowMean), rowUy = sin(rowMean);  // along-row unit vec
+
+  double treeSx = 0, treeCx = 0;
+  for (int i = 0; i < gTreeCount; i++) {
+    const DxfLine& L = gDxfLines[gTreeIdx[i]];
+    double a = atan2((double)(L.y2 - L.y1), (double)(L.x2 - L.x1)) * 2.0;
+    treeSx += sin(a); treeCx += cos(a);
+  }
+  double treeMean = atan2(treeSx, treeCx) / 2.0;
+  double treeUx = cos(treeMean), treeUy = sin(treeMean);  // along-tree unit vec
+
+  // Outer row = max |projection onto tree-direction| (row furthest along the tree axis).
+  int bestRow = gRowIdx[0]; double bestRowAbs = -1;
+  for (int i = 0; i < gRowCount; i++) {
+    const DxfLine& L = gDxfLines[gRowIdx[i]];
+    double mx = 0.5 * (L.x1 + L.x2);
+    double my = 0.5 * (L.y1 + L.y2);
+    double proj = mx * treeUx + my * treeUy;
+    if (fabs(proj) > bestRowAbs) { bestRowAbs = fabs(proj); bestRow = gRowIdx[i]; }
+  }
+  int bestTree = gTreeIdx[0]; double bestTreeAbs = -1;
+  for (int i = 0; i < gTreeCount; i++) {
+    const DxfLine& L = gDxfLines[gTreeIdx[i]];
+    double mx = 0.5 * (L.x1 + L.x2);
+    double my = 0.5 * (L.y1 + L.y2);
+    double proj = mx * rowUx + my * rowUy;
+    if (fabs(proj) > bestTreeAbs) { bestTreeAbs = fabs(proj); bestTree = gTreeIdx[i]; }
+  }
+
+  const DxfLine& R = gDxfLines[bestRow];
+  const DxfLine& T = gDxfLines[bestTree];
+  gEdgeRowX1 = R.x1; gEdgeRowY1 = R.y1; gEdgeRowX2 = R.x2; gEdgeRowY2 = R.y2;
+  gEdgeTreeX1 = T.x1; gEdgeTreeY1 = T.y1; gEdgeTreeX2 = T.x2; gEdgeTreeY2 = T.y2;
+  gEdgeRowHdg  = lineHeadingDeg(R.x1, R.y1, R.x2, R.y2);
+  gEdgeTreeHdg = lineHeadingDeg(T.x1, T.y1, T.x2, T.y2);
+  gHasEdges = true;
+}
+
+// Serialise a single TrackLines.txt record in AOG v6 format:
+//   <name>
+//   <heading in radians>
+//   <ptA.E>,<ptA.N>
+//   <ptB.E>,<ptB.N>
+//   <nudge offset>
+//   <mode>        (2 = AB line in the observed sample)
+//   <visible>     (True/False)
+//   <trailing flag>   (0 in the observed sample)
+// Lines use CRLF to match the Windows-side AOG file, 8 lines per record.
+static String formatTrackRecord(const char* name, float hdgDeg,
+                                float x1, float y1, float x2, float y2) {
+  float hdgRad = hdgDeg * (float)(M_PI / 180.0);
+  char buf[260];
+  snprintf(buf, sizeof(buf),
+    "%s\r\n"
+    "%.15f\r\n"
+    "%.3f,%.3f\r\n"
+    "%.3f,%.3f\r\n"
+    "0\r\n"
+    "2\r\n"
+    "True\r\n"
+    "0\r\n",
+    name, hdgRad, x1, y1, x2, y2);
+  return String(buf);
+}
+
+// AOG TrackLines.txt layout is: "$TrackLines" header line, then
+// fixed-size 8-line records per track. Strip any record whose name
+// matches either edge-line name so re-uploads overwrite cleanly.
+// Falls back to returning the source unchanged if no $TrackLines
+// header is present (so custom / hand-edited files aren't mangled).
+static String stripPriorEdges(const String& src,
+                              const char* nameA, const char* nameB) {
+  int hdr = src.indexOf("$TrackLines");
+  if (hdr < 0) return src;
+  int nl = src.indexOf('\n', hdr);
+  if (nl < 0) return src;
+  String out; out.reserve(src.length() + 16);
+  out += src.substring(0, nl + 1);  // keep everything up to and incl the header line
+  int cursor = nl + 1;
+  const int RECORD_LINES = 8;
+  while (cursor < (int)src.length()) {
+    // Find the 8 line boundaries for this record
+    int pos[RECORD_LINES + 1];
+    pos[0] = cursor;
+    int found = 0;
+    for (int i = 1; i <= RECORD_LINES; i++) {
+      int p = src.indexOf('\n', pos[i - 1]);
+      if (p < 0) { pos[i] = src.length(); break; }
+      pos[i] = p + 1;
+      found = i;
+    }
+    if (found < RECORD_LINES) {
+      // Partial record at end — copy verbatim (don't silently drop).
+      out += src.substring(cursor);
+      break;
+    }
+    // Name is the first line of the record
+    String nm = src.substring(pos[0], pos[1] - 1);
+    // Trim trailing \r from CRLF files
+    while (nm.length() > 0 && (nm.charAt(nm.length() - 1) == '\r' || nm.charAt(nm.length() - 1) == ' ')) {
+      nm.remove(nm.length() - 1);
+    }
+    bool match = (nm == nameA) || (nm == nameB);
+    if (!match) {
+      out += src.substring(pos[0], pos[RECORD_LINES]);
+    }
+    cursor = pos[RECORD_LINES];
+  }
+  return out;
+}
+
+// Build the final TrackLines.txt content. If existing is non-empty,
+// prior edges-by-name are stripped and the two new records appended;
+// otherwise a minimal file with a "$TrackLines" header + two records
+// is returned.
+static String buildTrackLinesFile(const String& existing) {
+  if (!gHasEdges) return existing;
+  String base;
+  if (existing.length() > 0 && existing.indexOf("$TrackLines") >= 0) {
+    base = stripPriorEdges(existing, gEdgeRowName, gEdgeTreeName);
+    if (base.length() > 0) {
+      char last = base.charAt(base.length() - 1);
+      if (last != '\n') base += "\r\n";
+    }
+  } else {
+    base = "$TrackLines\r\n";
+  }
+  base += formatTrackRecord(gEdgeRowName, gEdgeRowHdg,
+                            gEdgeRowX1, gEdgeRowY1, gEdgeRowX2, gEdgeRowY2);
+  base += formatTrackRecord(gEdgeTreeName, gEdgeTreeHdg,
+                            gEdgeTreeX1, gEdgeTreeY1, gEdgeTreeX2, gEdgeTreeY2);
+  return base;
+}
+
 // ── Build the AB-mode intersection grid ───────────────────────
 // Origin (row 0 / tree 0) = intersection of the Row and Tree AB lines,
 // computed once in resolveActiveABLines() as gAbOriginE/N.
@@ -2052,6 +2606,7 @@ void handleFieldUpload() {
   resolveActiveABLines();
   if (gHasLines) {
     gGridMode = MODE_AB;
+    gGridSource = SRC_ABLINES;
     buildAbIntersections();
   }
   saveAbPrefs();
@@ -2086,16 +2641,254 @@ void handleFieldApply() {
   if (tn.length() > 0) strlcpy(gTreeLineName, tn.c_str(), sizeof(gTreeLineName));
   if (newMode == MODE_SIMPLE || newMode == MODE_AB) gGridMode = newMode;
 
-  resolveActiveABLines();
-  if (gGridMode == MODE_AB && gHasLines) buildAbIntersections();
-  else                                   numIntersections = 0;
+  if (gGridSource == SRC_DXF) {
+    // DXF source: intersections[] is already cached; don't touch it
+    // beyond clearing when the user switches back to SIMPLE mode.
+    if (gGridMode == MODE_SIMPLE) numIntersections = 0;
+  } else {
+    resolveActiveABLines();
+    if (gGridMode == MODE_AB && gHasLines) buildAbIntersections();
+    else                                   numIntersections = 0;
+  }
   saveAbPrefs();
 
   char out[200];
   snprintf(out, sizeof(out),
-    "{\"ok\":true,\"mode\":%d,\"linesOk\":%s,\"intersections\":%d}",
-    gGridMode, gHasLines ? "true" : "false", numIntersections);
+    "{\"ok\":true,\"mode\":%d,\"source\":%d,\"linesOk\":%s,\"intersections\":%d}",
+    gGridMode, gGridSource,
+    (gGridSource == SRC_DXF) ? "true" : (gHasLines ? "true" : "false"),
+    numIntersections);
   webServer.send(200, "application/json", out);
+}
+
+// ================================================================
+//  DXF upload — /field/dxf
+//  Multipart form with two optional files (dxf, tracklines) and
+//  query-string args: anchorSrc=field|manual, lat, lon, rowLayer,
+//  treeLayer, edgeRow, edgeTree, rowName, treeName.
+//  The anchor comes from either an AOG Field.txt (included as a form
+//  field "field") or from the lat/lon query args.
+// ================================================================
+
+// State shared between the chunk and end handlers for a single upload.
+static bool   gDxfUploadOk   = false;
+static bool   gDxfUploadSeen = false;   // saw the dxf file at all
+static String gDxfFieldTxt;             // accumulated Field.txt (form field "field")
+static String gDxfTracklines;           // accumulated existing TrackLines.txt
+static String gDxfRawSample;            // first ~16 KB of raw DXF, saved to LittleFS
+
+static void dxfUploadBegin() {
+  gDxfUploadOk = false;
+  gDxfUploadSeen = false;
+  gDxfLineCount = 0;
+  gDxfBadLines  = 0;
+  gDxfBinaryRejected = false;
+  gDxfFieldTxt = "";
+  gDxfTracklines = "";
+  gDxfRawSample = "";
+  gDxfParser.reset();
+  if (gDxfLines == nullptr) {
+    gDxfLines = (DxfLine*)ps_malloc(sizeof(DxfLine) * MAX_DXF_LINES);
+    if (!gDxfLines) {
+      // PSRAM unavailable — fall back to heap with a much smaller cap
+      gDxfLineCap = 256;
+      gDxfLines = (DxfLine*)malloc(sizeof(DxfLine) * gDxfLineCap);
+    } else {
+      gDxfLineCap = MAX_DXF_LINES;
+    }
+  }
+}
+
+static void dxfUploadEndFree() {
+  if (gDxfLines) { free(gDxfLines); gDxfLines = nullptr; gDxfLineCap = 0; }
+  gDxfFieldTxt = "";
+  gDxfTracklines = "";
+  gDxfRawSample = "";
+}
+
+// Chunk handler. WebServer invokes this once per multipart field per
+// chunk; we switch on the field name to decide where the bytes go.
+void handleDxfUploadChunk() {
+  HTTPUpload& up = webServer.upload();
+  const String& name = up.name;   // form field name (dxf / field / tracklines)
+  if (up.status == UPLOAD_FILE_START) {
+    if (name == "dxf") {
+      dxfUploadBegin();
+      gDxfUploadSeen = true;
+    }
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (name == "dxf") {
+      if (gDxfLines == nullptr) return;
+      gDxfParser.feed(up.buf, up.currentSize);
+      if (gDxfRawSample.length() < 16384) {
+        size_t take = up.currentSize;
+        if (gDxfRawSample.length() + take > 16384) take = 16384 - gDxfRawSample.length();
+        for (size_t i = 0; i < take; i++) gDxfRawSample += (char)up.buf[i];
+      }
+    } else if (name == "field") {
+      for (size_t i = 0; i < up.currentSize; i++) gDxfFieldTxt += (char)up.buf[i];
+    } else if (name == "tracklines") {
+      for (size_t i = 0; i < up.currentSize; i++) gDxfTracklines += (char)up.buf[i];
+    }
+  } else if (up.status == UPLOAD_FILE_END) {
+    if (name == "dxf") {
+      gDxfParser.finish();
+      gDxfUploadOk = !gDxfBinaryRejected;
+    }
+  } else if (up.status == UPLOAD_FILE_ABORTED) {
+    if (name == "dxf") { dxfUploadEndFree(); }
+  }
+}
+
+// Completion handler. Validates, classifies, builds intersections,
+// picks outer edges, merges TrackLines, persists, responds JSON.
+void handleDxfUploadEnd() {
+  if (!gDxfUploadSeen) {
+    sendJsonErr(400, "No DXF file uploaded", "Form field 'dxf' missing");
+    dxfUploadEndFree();
+    return;
+  }
+  if (gDxfBinaryRejected) {
+    sendJsonErr(400, "Binary DXF not supported — save as ASCII DXF");
+    dxfUploadEndFree();
+    return;
+  }
+  if (!gDxfUploadOk) {
+    sendJsonErr(500, "DXF upload failed mid-stream");
+    dxfUploadEndFree();
+    return;
+  }
+  if (gDxfLineCount == 0) {
+    sendJsonErr(400, "No LINE entities found in DXF",
+                "Check that rows/trees are drawn as LINE (not POLYLINE)");
+    dxfUploadEndFree();
+    return;
+  }
+
+  // Optional layer/edge overrides from query string
+  String q = webServer.arg("rowLayer");  if (q.length()) strlcpy(gRowLayer,  q.c_str(), sizeof(gRowLayer));
+  q        = webServer.arg("treeLayer"); if (q.length()) strlcpy(gTreeLayer, q.c_str(), sizeof(gTreeLayer));
+  q        = webServer.arg("edgeRow");   if (q.length()) strlcpy(gEdgeRowName,  q.c_str(), sizeof(gEdgeRowName));
+  q        = webServer.arg("edgeTree");  if (q.length()) strlcpy(gEdgeTreeName, q.c_str(), sizeof(gEdgeTreeName));
+
+  // Anchor resolution
+  String anchorSrc = webServer.arg("anchorSrc");
+  double aLat = 0, aLon = 0;
+  bool   gotAnchor = false;
+  if (anchorSrc == "field") {
+    if (gDxfFieldTxt.length() == 0) {
+      sendJsonErr(400, "anchorSrc=field but no Field.txt provided",
+                  "Attach your AgOpenGPS Field.txt or switch to manual anchor");
+      dxfUploadEndFree();
+      return;
+    }
+    if (!parseFieldTxt(gDxfFieldTxt, aLat, aLon)) {
+      sendJsonErr(400, "Could not parse Field.txt — expected StartFix line");
+      dxfUploadEndFree();
+      return;
+    }
+    gotAnchor = true;
+  } else if (anchorSrc == "manual") {
+    String ls = webServer.arg("lat");
+    String ns = webServer.arg("lon");
+    if (ls.length() == 0 || ns.length() == 0) {
+      sendJsonErr(400, "anchorSrc=manual needs lat and lon query args");
+      dxfUploadEndFree();
+      return;
+    }
+    aLat = ls.toDouble(); aLon = ns.toDouble();
+    if (aLat < -90 || aLat > 90 || aLon < -180 || aLon > 180) {
+      sendJsonErr(400, "anchorSrc=manual lat/lon out of range");
+      dxfUploadEndFree();
+      return;
+    }
+    gotAnchor = true;
+  }
+  if (!gotAnchor) {
+    sendJsonErr(400, "Missing anchorSrc — use 'field' or 'manual'");
+    dxfUploadEndFree();
+    return;
+  }
+  gAnchorLat = aLat; gAnchorLon = aLon; gHasField = true;
+
+  // Classify, build intersections, pick outer edges
+  classifyDxfLines();
+  if (gRowCount == 0 || gTreeCount == 0) {
+    char detail[120];
+    snprintf(detail, sizeof(detail),
+      "Found rowLayer=%s: %d lines, treeLayer=%s: %d lines",
+      gRowLayer, gRowCount, gTreeLayer, gTreeCount);
+    sendJsonErr(400, "DXF has no lines on one of the layers", detail);
+    dxfUploadEndFree();
+    return;
+  }
+  bool overflow = buildDxfIntersections();
+  pickOuterDxfLines();
+  gTrackLinesOut = buildTrackLinesFile(gDxfTracklines);
+
+  // Persist raw DXF sample to LittleFS (non-fatal on failure)
+  if (LittleFS.begin(true)) {
+    File f = LittleFS.open("/dxf.last", "w");
+    if (f) { f.print(gDxfRawSample); f.close(); }
+  }
+
+  // Switch to MODE_AB with DXF source; persist everything.
+  gGridMode   = MODE_AB;
+  gGridSource = SRC_DXF;
+  gHasLines   = false;  // no AB-line recipe to apply
+  saveAbPrefs();
+  saveGridPrefs();      // gNumRows/gNumTrees were updated by buildDxfIntersections
+
+  // Build JSON response
+  char out[640];
+  snprintf(out, sizeof(out),
+    "{\"ok\":true,\"anchorSrc\":\"%s\","
+    "\"field\":{\"anchorLat\":%.7f,\"anchorLon\":%.7f},"
+    "\"rowLayer\":\"%s\",\"treeLayer\":\"%s\","
+    "\"rowLines\":%d,\"treeLines\":%d,"
+    "\"intersections\":%d,\"rawIntersections\":%d,"
+    "\"overflow\":%s,\"badLines\":%d,"
+    "\"edge\":{\"row\":\"%s\",\"rowHdg\":%.3f,\"tree\":\"%s\",\"treeHdg\":%.3f},"
+    "\"tracklinesMerged\":%s,\"trackBytes\":%d,"
+    "\"mode\":%d,\"source\":%d}",
+    anchorSrc.c_str(),
+    gAnchorLat, gAnchorLon,
+    gRowLayer, gTreeLayer,
+    gRowCount, gTreeCount,
+    numIntersections, lastRawIntersections,
+    overflow ? "true" : "false", gDxfBadLines,
+    gEdgeRowName, gEdgeRowHdg, gEdgeTreeName, gEdgeTreeHdg,
+    (gDxfTracklines.length() > 0) ? "true" : "false",
+    (int)gTrackLinesOut.length(),
+    gGridMode, gGridSource);
+  webServer.send(200, "application/json", out);
+  Serial.printf("[DXF] Upload OK: anchor=(%.7f,%.7f), %d rows × %d trees → %d intersections\n",
+                gAnchorLat, gAnchorLon, gRowCount, gTreeCount, numIntersections);
+
+  dxfUploadEndFree();
+}
+
+// GET /field/tracklines/download — serves the merged/stubbed file.
+void handleTracklinesDownload() {
+  if (gTrackLinesOut.length() == 0) {
+    webServer.send(404, "text/plain",
+      "No TrackLines.txt generated yet — upload a DXF first");
+    return;
+  }
+  webServer.sendHeader("Content-Disposition",
+                       "attachment; filename=\"TrackLines.txt\"");
+  webServer.send(200, "text/plain", gTrackLinesOut);
+}
+
+// GET /field/dxf/raw — serves the last raw DXF (up to 16 KB) for debugging.
+void handleDxfRaw() {
+  if (!LittleFS.begin(true)) { webServer.send(500, "text/plain", "LittleFS unavailable"); return; }
+  File f = LittleFS.open("/dxf.last", "r");
+  if (!f) { webServer.send(404, "text/plain", "No DXF uploaded yet"); return; }
+  webServer.sendHeader("Content-Disposition",
+                       "attachment; filename=\"dxf.last.dxf\"");
+  webServer.streamFile(f, "application/dxf");
+  f.close();
 }
 
 // GET /api/grid — planned tree positions as lat/lon, either from
@@ -2235,20 +3028,28 @@ void handleHits() {
 void handleFieldState() {
   char names[256];
   listABLineNames(gAbLinesRaw, names, sizeof(names));
-  char out[700];
+  char out[900];
   snprintf(out, sizeof(out),
-    "{\"mode\":%d,\"hasField\":%s,\"hasLines\":%s,"
+    "{\"mode\":%d,\"source\":%d,\"hasField\":%s,\"hasLines\":%s,"
     "\"field\":{\"anchorLat\":%.7f,\"anchorLon\":%.7f},"
     "\"rowName\":\"%s\",\"treeName\":\"%s\","
+    "\"rowLayer\":\"%s\",\"treeLayer\":\"%s\","
+    "\"edgeRow\":\"%s\",\"edgeTree\":\"%s\","
+    "\"hasEdges\":%s,\"edgeRowHdg\":%.3f,\"edgeTreeHdg\":%.3f,"
     "\"availableLines\":\"%s\",\"intersections\":%d,"
     "\"rawIntersections\":%d,\"hasBoundary\":%s,\"boundary\":%d,"
-    "\"abSize\":%d}",
-    gGridMode, gHasField ? "true" : "false", gHasLines ? "true" : "false",
+    "\"abSize\":%d,\"trackBytes\":%d}",
+    gGridMode, gGridSource,
+    gHasField ? "true" : "false", gHasLines ? "true" : "false",
     gAnchorLat, gAnchorLon,
-    gRowLineName, gTreeLineName, names,
+    gRowLineName, gTreeLineName,
+    gRowLayer, gTreeLayer,
+    gEdgeRowName, gEdgeTreeName,
+    gHasEdges ? "true" : "false", gEdgeRowHdg, gEdgeTreeHdg,
+    names,
     numIntersections, lastRawIntersections,
     gHasBoundary ? "true" : "false", numBoundary,
-    (int)gAbLinesRaw.length());
+    (int)gAbLinesRaw.length(), (int)gTrackLinesOut.length());
   webServer.sendHeader("Access-Control-Allow-Origin", "*");
   webServer.send(200, "application/json", out);
 }
@@ -2320,8 +3121,17 @@ void setup() {
   loadPrefs();
   buildGrid();
   if (gGridMode == MODE_AB) {
-    resolveActiveABLines();
-    if (gHasLines) buildAbIntersections();
+    if (gGridSource == SRC_DXF) {
+      // intersections[] was restored from NVS by loadPrefs()
+      Serial.printf("[DXF] Restored %d intersections from NVS cache\n",
+                    numIntersections);
+    } else {
+      resolveActiveABLines();
+      if (gHasLines) buildAbIntersections();
+    }
+  }
+  if (!LittleFS.begin(true)) {
+    Serial.println("LittleFS mount failed — raw DXF persistence disabled");
   }
 
   // If DL button is held at boot, force AP setup mode.
@@ -2349,6 +3159,9 @@ void setup() {
   webServer.on("/field/upload",HTTP_POST, handleFieldUpload);
   webServer.on("/field/apply", HTTP_POST, handleFieldApply);
   webServer.on("/field/state", HTTP_GET,  handleFieldState);
+  webServer.on("/field/dxf",   HTTP_POST, handleDxfUploadEnd, handleDxfUploadChunk);
+  webServer.on("/field/tracklines/download", HTTP_GET, handleTracklinesDownload);
+  webServer.on("/field/dxf/raw", HTTP_GET, handleDxfRaw);
   // Captive-portal catch-all: anything unknown in AP mode redirects to setup
   webServer.onNotFound([]() {
     if (apMode) { webServer.send_P(200, "text/html", SETUP_PAGE); }
