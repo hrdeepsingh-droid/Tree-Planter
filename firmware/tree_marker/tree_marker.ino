@@ -30,7 +30,17 @@
 //         Two outer perimeter lines exported as AgOpenGPS
 //         TrackLines.txt (merge or stub) so autosteer tracks the
 //         surveyed DXF edges.
-#define FW_VERSION "1.5.1"
+// 1.5.1 — Self-update repo URL pointed at hrdeepsingh-droid/Tree-Planter.
+// 1.5.2 — DXF parser now also reads LWPOLYLINE entities (each consecutive
+//         vertex pair becomes a segment, closed polylines emit a closing
+//         segment). Layer-name classification replaced with auto-detect:
+//         the parser builds a 1° bearing histogram, picks the two highest
+//         peaks ≥60° apart, classifies segments to whichever bearing they
+//         fall within ±5° of, then assigns the larger-perpendicular-spacing
+//         group as "rows" (orchard convention). Detection telemetry
+//         (bearings, spacings, kept/total counts) is returned in the
+//         /field/dxf JSON response and surfaced in the upload status pane.
+#define FW_VERSION "1.5.2"
 
 // ================================================================
 //  COMPILED-IN DEFAULTS — overridden by Preferences after first save
@@ -634,7 +644,7 @@ main{max-width:920px;margin:0 auto;padding:22px 20px 48px}
     <div class=fg><label>Existing TrackLines.txt <span style="color:var(--mu);font-weight:400;text-transform:none;letter-spacing:0">(optional &mdash; merge into)</span></label><input id=fd-trk type=file accept=".txt"></div>
     <button class="btn btn-p" onclick=dxfUpload()><span>Upload DXF &amp; Apply</span><span class=bi>&#8593;</span></button>
     <button class="btn btn-g" id=fd-dl-trk onclick=downloadTracklines() disabled><span>Download TrackLines.txt</span><span class=bi>&#8659;</span></button>
-    <p class=note id=fd-dxf-status>Draw row and tree LINE entities on layers named Row / Tree. Trees are the pairwise intersections.</p>
+    <p class=note id=fd-dxf-status>Draw your grid as LINE or LWPOLYLINE entities &mdash; rows and trees are auto-detected by line direction (no layer-name match required). Trees are the pairwise intersections of the two perpendicular bearing groups.</p>
   </div>
   <div class=card>
     <div class=clbl>Active Line Names</div>
@@ -965,7 +975,12 @@ var dxfUpload=async ()=>{
     var txt=await r.text();
     var d; try{d=JSON.parse(txt);}catch(e){d={ok:false,error:txt||('HTTP '+r.status)};}
     if(d.ok){
-      var msg=d.intersections+' intersections ('+d.rowLines+' rows × '+d.treeLines+' trees)';
+      var msg='';
+      if(d.detected){
+        msg+='Detected: rows '+d.detected.bearingRow.toFixed(1)+'° @ '+d.detected.spacingRow.toFixed(2)+'m × trees '+d.detected.bearingTree.toFixed(1)+'° @ '+d.detected.spacingTree.toFixed(2)+'m';
+        msg+=' (kept '+d.detected.keptSegments+' of '+d.detected.totalSegments+' segments). ';
+      }
+      msg+=d.intersections+' intersections ('+d.rowLines+' rows × '+d.treeLines+' trees)';
       if(d.overflow)msg+=' — OVERFLOW, some skipped';
       msg+='. Anchor '+d.field.anchorLat.toFixed(7)+','+d.field.anchorLon.toFixed(7);
       msg+='. Edges: '+d.edge.row+' ('+d.edge.rowHdg.toFixed(1)+'°), '+d.edge.tree+' ('+d.edge.treeHdg.toFixed(1)+'°).';
@@ -1739,10 +1754,28 @@ struct DxfParser {
   String tail;
   int    code;             // last group code seen (-1 = waiting for code)
   bool   waitingForValue;  // true after reading a code, before its value
-  bool   inLine;           // true between "0 LINE" and the next "0 ..."
+
+  // Exactly one of these is true at a time, between matching "0 ..." codes.
+  bool   inLine;
+  bool   inLwPolyline;
+
+  // Shared layer name (carried for either entity type)
+  char   layer[24];
+
+  // LINE-specific endpoints (group codes 10/20/11/21)
   float  x1,y1,x2,y2;
   bool   hasX1,hasY1,hasX2,hasY2;
-  char   layer[24];
+
+  // LWPOLYLINE vertex streaming. Each new (10,20) pair, after the first,
+  // emits a segment from the previous vertex to the new one. If the
+  // polyline is flagged closed (group code 70 bit 0), an extra closing
+  // segment is emitted in flushEntity().
+  bool   lwClosed;
+  bool   lwHaveFirst;
+  bool   lwHaveNewX;     // saw a 10-code, waiting for its paired 20
+  float  lwNewX;
+  float  lwFirstX, lwFirstY;
+  float  lwPrevX,  lwPrevY;
 
   void reset() {
     tail = "";
@@ -1752,21 +1785,42 @@ struct DxfParser {
   }
   void resetEntity() {
     inLine = false;
+    inLwPolyline = false;
     hasX1 = hasY1 = hasX2 = hasY2 = false;
     x1 = y1 = x2 = y2 = 0;
     layer[0] = '\0';
+    lwClosed = false;
+    lwHaveFirst = false;
+    lwHaveNewX = false;
+    lwNewX = lwFirstX = lwFirstY = lwPrevX = lwPrevY = 0;
   }
-  // Flush the current in-progress entity. Only LINE entities with all
-  // four endpoint coordinates present are pushed; anything else is
-  // counted as a "bad line" but not an error.
+
+  // Push a single segment into gDxfLines. Skips zero-length segments and
+  // counts overflows in gDxfBadLines.
+  static inline void pushSeg(float ax, float ay, float bx, float by, const char* lyr) {
+    if (gDxfLineCount >= gDxfLineCap) { gDxfBadLines++; return; }
+    float dx = bx - ax, dy = by - ay;
+    if (dx*dx + dy*dy < 1e-6f) return;
+    DxfLine& l = gDxfLines[gDxfLineCount++];
+    l.x1 = ax; l.y1 = ay; l.x2 = bx; l.y2 = by;
+    strlcpy(l.layer, lyr, sizeof(l.layer));
+  }
+
+  // Flush the current in-progress entity. LINE: emit one segment if all
+  // four endpoint codes were seen. LWPOLYLINE: open segments were emitted
+  // inline as each (10,20) pair arrived; here we only emit the closing
+  // segment if the polyline is flagged closed.
   void flushEntity() {
     if (inLine) {
-      if (hasX1 && hasY1 && hasX2 && hasY2 && gDxfLineCount < gDxfLineCap) {
-        DxfLine& l = gDxfLines[gDxfLineCount++];
-        l.x1 = x1; l.y1 = y1; l.x2 = x2; l.y2 = y2;
-        strlcpy(l.layer, layer, sizeof(l.layer));
-      } else if (inLine) {
+      if (hasX1 && hasY1 && hasX2 && hasY2) {
+        pushSeg(x1, y1, x2, y2, layer);
+      } else {
         gDxfBadLines++;
+      }
+    } else if (inLwPolyline) {
+      if (lwClosed && lwHaveFirst &&
+          (lwPrevX != lwFirstX || lwPrevY != lwFirstY)) {
+        pushSeg(lwPrevX, lwPrevY, lwFirstX, lwFirstY, layer);
       }
     }
     resetEntity();
@@ -1774,20 +1828,40 @@ struct DxfParser {
   void handlePair(int c, const String& v) {
     String val = v; val.trim();
     if (c == 0) {
-      // Entity terminator — flush previous, then check if this starts a new LINE
       flushEntity();
-      if (val == "LINE") {
-        inLine = true;
+      if      (val == "LINE")        inLine = true;
+      else if (val == "LWPOLYLINE")  inLwPolyline = true;
+      return;
+    }
+    if (c == 8) {
+      if (inLine || inLwPolyline) strlcpy(layer, val.c_str(), sizeof(layer));
+      return;
+    }
+    if (inLine) {
+      if      (c == 10) { x1 = val.toFloat(); hasX1 = true; }
+      else if (c == 20) { y1 = val.toFloat(); hasY1 = true; }
+      else if (c == 11) { x2 = val.toFloat(); hasX2 = true; }
+      else if (c == 21) { y2 = val.toFloat(); hasY2 = true; }
+    } else if (inLwPolyline) {
+      if (c == 70) {
+        lwClosed = ((val.toInt() & 1) != 0);
+      } else if (c == 10) {
+        lwNewX = val.toFloat();
+        lwHaveNewX = true;
+      } else if (c == 20) {
+        if (!lwHaveNewX) return;
+        float newY = val.toFloat();
+        if (!lwHaveFirst) {
+          lwFirstX = lwNewX; lwFirstY = newY;
+          lwPrevX  = lwNewX; lwPrevY  = newY;
+          lwHaveFirst = true;
+        } else {
+          pushSeg(lwPrevX, lwPrevY, lwNewX, newY, layer);
+          lwPrevX = lwNewX; lwPrevY = newY;
+        }
+        lwHaveNewX = false;
       }
-    } else if (!inLine) {
-      // Inside header/tables/blocks section — ignore codes outside LINEs.
-    } else if (c == 8) {
-      strlcpy(layer, val.c_str(), sizeof(layer));
-    } else if (c == 10) { x1 = val.toFloat(); hasX1 = true; }
-    else if (c == 20) { y1 = val.toFloat(); hasY1 = true; }
-    else if (c == 11) { x2 = val.toFloat(); hasX2 = true; }
-    else if (c == 21) { y2 = val.toFloat(); hasY2 = true; }
-    // other codes ignored
+    }
   }
   void feed(const uint8_t* buf, size_t n) {
     if (n == 0) return;
@@ -1853,13 +1927,184 @@ static int  gRowIdx[MAX_DXF_LINES];
 static int  gTreeIdx[MAX_DXF_LINES];
 static int  gRowCount = 0, gTreeCount = 0;
 
+// v1.5.2: detection telemetry from auto-bearing classifier. Surfaced
+// in the /field/dxf JSON response so the user can sanity-check before
+// driving on the result.
+static float gDetectedBearingA = 0;   // bearing assigned to "rows", deg mod 180
+static float gDetectedBearingB = 0;   // bearing assigned to "trees"
+static float gDetectedSpacingA = 0;   // perpendicular spacing of rows (m)
+static float gDetectedSpacingB = 0;   // perpendicular spacing of trees (m)
+static int   gDxfTotalSegments = 0;   // total segments parsed (LINE + LWPOLYLINE)
+static int   gDxfKeptSegments  = 0;   // segments that fell into a bearing group
+
+// Bearing of a segment in degrees, modulo 180. 0° = +X (east),
+// 90° = +Y (north). 180° folds back to 0° (direction-agnostic).
+static float bearingMod180(float x1, float y1, float x2, float y2) {
+  double dx = x2 - x1, dy = y2 - y1;
+  double a = atan2(dy, dx) * 180.0 / M_PI;
+  while (a < 0)      a += 180.0;
+  while (a >= 180.0) a -= 180.0;
+  return (float)a;
+}
+
+static int cmpFloatAsc(const void* a, const void* b) {
+  float fa = *(const float*)a, fb = *(const float*)b;
+  return (fa < fb) ? -1 : (fa > fb) ? 1 : 0;
+}
+
+// Estimate the modal perpendicular spacing among a group of parallel
+// lines. Projects each line's midpoint onto the bearing's perpendicular,
+// sorts, histograms consecutive gaps to 0.1 m buckets up to 100 m, and
+// returns the peak bucket. Returns 0 if no clear mode.
+static float estimateModalSpacing(const int* idx, int count, float bearingDeg) {
+  if (count < 2) return 0;
+  float* axes = (float*)malloc(sizeof(float) * count);
+  if (!axes) return 0;
+  double br = (double)bearingDeg * M_PI / 180.0;
+  double nx = -sin(br), ny = cos(br);
+  for (int i = 0; i < count; i++) {
+    const DxfLine& L = gDxfLines[idx[i]];
+    double mx = 0.5 * (L.x1 + L.x2), my = 0.5 * (L.y1 + L.y2);
+    axes[i] = (float)(mx * nx + my * ny);
+  }
+  qsort(axes, count, sizeof(float), cmpFloatAsc);
+  static int sBucket[1000];
+  for (int i = 0; i < 1000; i++) sBucket[i] = 0;
+  for (int i = 1; i < count; i++) {
+    float g = axes[i] - axes[i-1];
+    if (g <= 0.05f) continue;
+    int bi = (int)(g * 10.0f + 0.5f);
+    if (bi >= 0 && bi < 1000) sBucket[bi]++;
+  }
+  free(axes);
+  int peak = 0;
+  for (int i = 1; i < 1000; i++) if (sBucket[i] > sBucket[peak]) peak = i;
+  return (peak == 0) ? 0.0f : peak * 0.1f;
+}
+
+// Replaces the legacy layer-name-based classifier. Auto-detects two
+// dominant perpendicular bearings in the parsed segment set, classifies
+// each segment into the closer bearing group (within ±5°), then assigns
+// the group with LARGER perpendicular spacing as "rows" (orchard
+// convention: row spacing > tree spacing). Sets gRowIdx, gTreeIdx,
+// gRowCount, gTreeCount, and the gDetected* globals.
 static void classifyDxfLines() {
   gRowCount = 0;
   gTreeCount = 0;
+  gDetectedBearingA = gDetectedBearingB = 0;
+  gDetectedSpacingA = gDetectedSpacingB = 0;
+  gDxfTotalSegments = gDxfLineCount;
+  gDxfKeptSegments  = 0;
+  if (gDxfLineCount < 2) return;
+
+  // 1. Bearing histogram (1° buckets)
+  static int sHist[180];
+  for (int i = 0; i < 180; i++) sHist[i] = 0;
   for (int i = 0; i < gDxfLineCount; i++) {
-    if      (layerMatch(gDxfLines[i].layer, gRowLayer)  && gRowCount  < MAX_DXF_LINES) gRowIdx[gRowCount++]   = i;
-    else if (layerMatch(gDxfLines[i].layer, gTreeLayer) && gTreeCount < MAX_DXF_LINES) gTreeIdx[gTreeCount++] = i;
+    const DxfLine& L = gDxfLines[i];
+    int bi = (int)(bearingMod180(L.x1, L.y1, L.x2, L.y2) + 0.5f);
+    if (bi >= 180) bi = 0;
+    sHist[bi]++;
   }
+  // 2. 3°-window smoothed copy
+  static int sSmooth[180];
+  for (int i = 0; i < 180; i++)
+    sSmooth[i] = sHist[(i + 179) % 180] + sHist[i] + sHist[(i + 1) % 180];
+
+  // 3. Primary peak
+  int pA = 0;
+  for (int i = 1; i < 180; i++) if (sSmooth[i] > sSmooth[pA]) pA = i;
+  // 4. Secondary peak ≥60° from primary
+  int pB = -1, bestB = -1;
+  for (int i = 0; i < 180; i++) {
+    int d = abs(i - pA); if (d > 90) d = 180 - d;
+    if (d < 60) continue;
+    if (sSmooth[i] > bestB) { bestB = sSmooth[i]; pB = i; }
+  }
+  if (pB < 0) {
+    Serial.println("[DXF] classify: no second bearing cluster — file may not be a grid");
+    return;
+  }
+
+  // 5. Centroid-refine each bearing within ±2° windows
+  double sumA = 0; int cntA0 = 0;
+  double sumB = 0; int cntB0 = 0;
+  for (int i = 0; i < gDxfLineCount; i++) {
+    const DxfLine& L = gDxfLines[i];
+    int bi = (int)(bearingMod180(L.x1, L.y1, L.x2, L.y2) + 0.5f);
+    if (bi >= 180) bi = 0;
+    int dA = abs(bi - pA); if (dA > 90) dA = 180 - dA;
+    int dB = abs(bi - pB); if (dB > 90) dB = 180 - dB;
+    if (dA <= 2) { sumA += bi; cntA0++; }
+    if (dB <= 2) { sumB += bi; cntB0++; }
+  }
+  float bA = (cntA0 > 0) ? (float)(sumA / cntA0) : (float)pA;
+  float bB = (cntB0 > 0) ? (float)(sumB / cntB0) : (float)pB;
+
+  // 6. Two-pass classify into temp buffers (PSRAM-friendly).
+  int* tA = (int*)ps_malloc(sizeof(int) * MAX_DXF_LINES);
+  if (!tA) tA = (int*)malloc(sizeof(int) * MAX_DXF_LINES);
+  int* tB = (int*)ps_malloc(sizeof(int) * MAX_DXF_LINES);
+  if (!tB) tB = (int*)malloc(sizeof(int) * MAX_DXF_LINES);
+  if (!tA || !tB) {
+    if (tA) free(tA);
+    if (tB) free(tB);
+    Serial.println("[DXF] classify: temp buffer alloc failed");
+    return;
+  }
+  int cA = 0, cB = 0;
+  const float TOL = 5.0f;
+  for (int i = 0; i < gDxfLineCount; i++) {
+    const DxfLine& L = gDxfLines[i];
+    float b = bearingMod180(L.x1, L.y1, L.x2, L.y2);
+    float dA = fabsf(b - bA); if (dA > 90) dA = 180 - dA;
+    float dB = fabsf(b - bB); if (dB > 90) dB = 180 - dB;
+    if (dA <= TOL && dA < dB) {
+      if (cA < MAX_DXF_LINES) tA[cA++] = i;
+    } else if (dB <= TOL) {
+      if (cB < MAX_DXF_LINES) tB[cB++] = i;
+    }
+  }
+  if (cA == 0 || cB == 0) {
+    Serial.println("[DXF] classify: empty bearing group after tolerance filter");
+    free(tA); free(tB);
+    return;
+  }
+
+  // 7. Estimate perpendicular spacing in each group (modal, 0.1 m bucket)
+  float spA = estimateModalSpacing(tA, cA, bA);
+  float spB = estimateModalSpacing(tB, cB, bB);
+
+  // 8. Assign LARGER-spacing group as "rows" (row spacing > tree spacing
+  //    is the orchard convention). Copy temp buffers into the global
+  //    index arrays in the chosen order, then free temps.
+  const int* rowSrc;  int rowSz;  float rowBearing,  rowSpacing;
+  const int* treeSrc; int treeSz; float treeBearing, treeSpacing;
+  if (spA >= spB) {
+    rowSrc  = tA; rowSz  = cA; rowBearing  = bA; rowSpacing  = spA;
+    treeSrc = tB; treeSz = cB; treeBearing = bB; treeSpacing = spB;
+  } else {
+    rowSrc  = tB; rowSz  = cB; rowBearing  = bB; rowSpacing  = spB;
+    treeSrc = tA; treeSz = cA; treeBearing = bA; treeSpacing = spA;
+  }
+  gRowCount  = (rowSz  > MAX_DXF_LINES) ? MAX_DXF_LINES : rowSz;
+  for (int i = 0; i < gRowCount;  i++) gRowIdx[i]  = rowSrc[i];
+  gTreeCount = (treeSz > MAX_DXF_LINES) ? MAX_DXF_LINES : treeSz;
+  for (int i = 0; i < gTreeCount; i++) gTreeIdx[i] = treeSrc[i];
+
+  gDetectedBearingA = rowBearing;
+  gDetectedBearingB = treeBearing;
+  gDetectedSpacingA = rowSpacing;
+  gDetectedSpacingB = treeSpacing;
+  gDxfKeptSegments  = gRowCount + gTreeCount;
+
+  free(tA); free(tB);
+
+  Serial.printf("[DXF] classify: rows=%d (bearing=%.1f° spacing=%.2fm), "
+                "trees=%d (bearing=%.1f° spacing=%.2fm), kept %d/%d segments\n",
+                gRowCount, rowBearing, rowSpacing,
+                gTreeCount, treeBearing, treeSpacing,
+                gDxfKeptSegments, gDxfTotalSegments);
 }
 
 // Line-heading in AOG convention (0°=N, 90°=E, clockwise). DXF uses
@@ -2759,8 +3004,8 @@ void handleDxfUploadEnd() {
     return;
   }
   if (gDxfLineCount == 0) {
-    sendJsonErr(400, "No LINE entities found in DXF",
-                "Check that rows/trees are drawn as LINE (not POLYLINE)");
+    sendJsonErr(400, "No line geometry parsed from DXF",
+                "File contains no LINE or LWPOLYLINE entities");
     dxfUploadEndFree();
     return;
   }
@@ -2811,14 +3056,16 @@ void handleDxfUploadEnd() {
   }
   gAnchorLat = aLat; gAnchorLon = aLon; gHasField = true;
 
-  // Classify, build intersections, pick outer edges
+  // Classify (auto-detect two perpendicular bearings), build intersections,
+  // pick outer edges.
   classifyDxfLines();
   if (gRowCount == 0 || gTreeCount == 0) {
-    char detail[120];
+    char detail[160];
     snprintf(detail, sizeof(detail),
-      "Found rowLayer=%s: %d lines, treeLayer=%s: %d lines",
-      gRowLayer, gRowCount, gTreeLayer, gTreeCount);
-    sendJsonErr(400, "DXF has no lines on one of the layers", detail);
+      "Parsed %d segments; auto-detect did not find two perpendicular "
+      "bearing groups. Check the DXF actually contains a grid of crossing lines.",
+      gDxfTotalSegments);
+    sendJsonErr(400, "DXF doesn't look like a grid", detail);
     dxfUploadEndFree();
     return;
   }
@@ -2840,7 +3087,7 @@ void handleDxfUploadEnd() {
   saveGridPrefs();      // gNumRows/gNumTrees were updated by buildDxfIntersections
 
   // Build JSON response
-  char out[640];
+  char out[1024];
   snprintf(out, sizeof(out),
     "{\"ok\":true,\"anchorSrc\":\"%s\","
     "\"field\":{\"anchorLat\":%.7f,\"anchorLon\":%.7f},"
@@ -2850,6 +3097,9 @@ void handleDxfUploadEnd() {
     "\"overflow\":%s,\"badLines\":%d,"
     "\"edge\":{\"row\":\"%s\",\"rowHdg\":%.3f,\"tree\":\"%s\",\"treeHdg\":%.3f},"
     "\"tracklinesMerged\":%s,\"trackBytes\":%d,"
+    "\"detected\":{\"bearingRow\":%.2f,\"bearingTree\":%.2f,"
+                  "\"spacingRow\":%.2f,\"spacingTree\":%.2f,"
+                  "\"totalSegments\":%d,\"keptSegments\":%d},"
     "\"mode\":%d,\"source\":%d}",
     anchorSrc.c_str(),
     gAnchorLat, gAnchorLon,
@@ -2860,6 +3110,9 @@ void handleDxfUploadEnd() {
     gEdgeRowName, gEdgeRowHdg, gEdgeTreeName, gEdgeTreeHdg,
     (gDxfTracklines.length() > 0) ? "true" : "false",
     (int)gTrackLinesOut.length(),
+    gDetectedBearingA, gDetectedBearingB,
+    gDetectedSpacingA, gDetectedSpacingB,
+    gDxfTotalSegments, gDxfKeptSegments,
     gGridMode, gGridSource);
   webServer.send(200, "application/json", out);
   Serial.printf("[DXF] Upload OK: anchor=(%.7f,%.7f), %d rows × %d trees → %d intersections\n",
