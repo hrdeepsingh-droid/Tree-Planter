@@ -120,6 +120,46 @@
 //             the upload status pane when |Δm| > 1m. Field.txt is
 //             also forwarded in manual mode so the diagnostic works
 //             without switching modes.
+// 1.5.9 — Two additions to the DXF upload pipeline for diagnosing
+//         persistent surveyor-side coordinate mismatches that the
+//         v1.5.8 CRS picker can't explain on its own. Field testing
+//         a Sunraysia block surfaced a ~504 m west / ~24 m north shift
+//         between the rendered grid and the physical orchard, with
+//         the projection math otherwise verified (Zone 54, ΔStartFix
+//         ≈ 0 m, edges plotting consistent with intersections). No
+//         standard datum jump explains 504 m, so the working theory
+//         is a wrong control point or an adjacent-block survey, and
+//         we need a way to nudge the DXF at upload time without
+//         re-exporting from CAD. While we're there, expose a datum
+//         choice for completeness — older surveys will inevitably
+//         arrive in GDA94.
+//         (1) ?dxfDatum=gda2020|gda94. gda2020 (default) is a no-op.
+//             gda94 adds (+1.6 m E, +1.0 m N) before the inverse
+//             projection — coarse plate-motion constant for
+//             GDA94→GDA2020 at Sunraysia latitude (~-34°S). The
+//             strict transform is the ICSM NTv2 grid file, but for
+//             a 3 m tree spacing the constant is fine to ~5 cm. A
+//             second <select> sits next to the CRS picker on the
+//             upload form.
+//         (2) ?dxfOffsetE= / ?dxfOffsetN= (decimal metres, default 0)
+//             are manual nudges in the surveyor's source frame.
+//             Two number inputs (step 0.1) under the picker row
+//             feed them. Use only when the rendered grid is shifted
+//             by an amount no datum change explains (wrong control
+//             point, adjacent block, future planting on a
+//             neighbouring paddock). Datum and manual offset
+//             compose: total = datum + manual, applied as a single
+//             E/N translation in the source CRS BEFORE the inverse
+//             projection (so dxfCrs=mga54/55/56/auto add the offset
+//             to the easting/northing fed to utmToLatLon). For
+//             dxfCrs=local the offset is applied directly in the
+//             local frame; for dxfCrs=latlon it's converted to
+//             lat/lon equivalents at gAnchorLat and added in
+//             degrees. The applied total is echoed back in the
+//             upload response JSON (dxfDatum, dxfOffsetE,
+//             dxfOffsetN) and shown in the dashboard status pane,
+//             plus a verbose Serial print at re-frame time so a
+//             field-side diagnosis trail is on the Serial monitor.
 // 1.5.3 — DXF fixes from real-world test: (1) bearing centroid now uses
 //         circular mean on doubled angle (sum of cos 2θ / sin 2θ), so
 //         clusters straddling the 0°/180° wrap collapse instead of being
@@ -135,7 +175,7 @@
 //         as grid" that switches source and scrolls to the upload card;
 //         (5) numIntersections / gNumRows / gNumTrees are zeroed on every
 //         /field/apply so old dots don't bleed through after a mode swap.
-#define FW_VERSION "1.5.8"
+#define FW_VERSION "1.5.9"
 
 // ================================================================
 //  COMPILED-IN DEFAULTS — overridden by Preferences after first save
@@ -744,16 +784,29 @@ main{max-width:920px;margin:0 auto;padding:22px 20px 48px}
       <div class=fg><label>Outer-row line name</label><input id=fd-erow type=text value=DXF-Row-Edge></div>
       <div class=fg><label>Outer-tree line name</label><input id=fd-etree type=text value=DXF-Tree-Edge></div>
     </div>
-    <div class=fg><label>DXF coordinate system</label>
-      <select id=fd-crs>
-        <option value=auto selected>Auto (UTM zone from anchor longitude)</option>
-        <option value=mga54>MGA Zone 54 (138&deg;E&ndash;144&deg;E)</option>
-        <option value=mga55>MGA Zone 55 (144&deg;E&ndash;150&deg;E)</option>
-        <option value=mga56>MGA Zone 56 (150&deg;E&ndash;156&deg;E)</option>
-        <option value=local>Local metres (already E/N from anchor)</option>
-        <option value=latlon>Lat/Lon (X=longitude, Y=latitude, degrees)</option>
-      </select>
+    <div class=g2>
+      <div class=fg><label>DXF coordinate system</label>
+        <select id=fd-crs>
+          <option value=auto selected>Auto (UTM zone from anchor longitude)</option>
+          <option value=mga54>MGA Zone 54 (138&deg;E&ndash;144&deg;E)</option>
+          <option value=mga55>MGA Zone 55 (144&deg;E&ndash;150&deg;E)</option>
+          <option value=mga56>MGA Zone 56 (150&deg;E&ndash;156&deg;E)</option>
+          <option value=local>Local metres (already E/N from anchor)</option>
+          <option value=latlon>Lat/Lon (X=longitude, Y=latitude, degrees)</option>
+        </select>
+      </div>
+      <div class=fg><label>Geodetic datum</label>
+        <select id=fd-datum>
+          <option value=gda2020 selected>GDA2020 (default &mdash; no shift)</option>
+          <option value=gda94>GDA94 (apply +1.6m E, +1.0m N)</option>
+        </select>
+      </div>
     </div>
+    <div class=g2>
+      <div class=fg><label>Manual offset E (m)</label><input id=fd-osE type=number step=0.1 value=0></div>
+      <div class=fg><label>Manual offset N (m)</label><input id=fd-osN type=number step=0.1 value=0></div>
+    </div>
+    <p class=note style="margin:-4px 0 10px">Manual offset nudges the DXF in the surveyor&rsquo;s source frame &mdash; use only if the rendered grid is shifted by an amount no datum change explains (e.g. wrong control point, adjacent block). Datum and manual offset compose.</p>
     <div class=fg><label>Existing TrackLines.txt <span style="color:var(--mu);font-weight:400;text-transform:none;letter-spacing:0">(optional &mdash; merge into)</span></label><input id=fd-trk type=file accept=".txt"></div>
     <button class="btn btn-p" onclick=dxfUpload()><span>Upload DXF &amp; Apply</span><span class=bi>&#8593;</span></button>
     <button class="btn btn-g" id=fd-dl-trk onclick=downloadTracklines() disabled><span>Download TrackLines.txt</span><span class=bi>&#8659;</span></button>
@@ -1079,11 +1132,17 @@ var dxfUpload=async ()=>{
   var er=document.getElementById('fd-erow').value.trim();
   var et=document.getElementById('fd-etree').value.trim();
   var crs=document.getElementById('fd-crs').value;
+  var datum=document.getElementById('fd-datum').value;
+  var osE=document.getElementById('fd-osE').value.trim();
+  var osN=document.getElementById('fd-osN').value.trim();
   if(rl)qs+='&rowLayer='+encodeURIComponent(rl);
   if(tl)qs+='&treeLayer='+encodeURIComponent(tl);
   if(er)qs+='&edgeRow='+encodeURIComponent(er);
   if(et)qs+='&edgeTree='+encodeURIComponent(et);
   if(crs)qs+='&dxfCrs='+encodeURIComponent(crs);
+  if(datum)qs+='&dxfDatum='+encodeURIComponent(datum);
+  if(osE)qs+='&dxfOffsetE='+encodeURIComponent(osE);
+  if(osN)qs+='&dxfOffsetN='+encodeURIComponent(osN);
   var trk=document.getElementById('fd-trk').files[0];
   if(trk)fd.append('tracklines',trk);
   st.style.color='';
@@ -1101,7 +1160,11 @@ var dxfUpload=async ()=>{
       msg+=d.intersections+' intersections ('+d.rowLines+' rows × '+d.treeLines+' trees)';
       if(d.overflow)msg+=' — OVERFLOW, some skipped';
       msg+='. Anchor '+d.field.anchorLat.toFixed(7)+','+d.field.anchorLon.toFixed(7);
-      if(d.dxfCrs)msg+=' (CRS '+d.dxfCrs+')';
+      if(d.dxfCrs)msg+=' (CRS '+d.dxfCrs;
+      if(d.dxfDatum)msg+=', '+d.dxfDatum;
+      if(d.dxfCrs)msg+=')';
+      if((d.dxfOffsetE&&Math.abs(d.dxfOffsetE)>0.0001)||(d.dxfOffsetN&&Math.abs(d.dxfOffsetN)>0.0001))
+        msg+=' (offset '+(d.dxfOffsetE||0).toFixed(2)+'E,'+(d.dxfOffsetN||0).toFixed(2)+'N)';
       msg+='. Edges: '+d.edge.row+' ('+d.edge.rowHdg.toFixed(1)+'°), '+d.edge.tree+' ('+d.edge.treeHdg.toFixed(1)+'°).';
       msg+=' TrackLines '+(d.tracklinesMerged?'merged':'stub')+' ('+d.trackBytes+' bytes).';
       // v1.5.8: anchor-vs-StartFix mismatch hint. AOG reads TrackLines.txt
@@ -3117,6 +3180,9 @@ static String gDxfFieldTxt;             // accumulated Field.txt (form field "fi
 static String gDxfTracklines;           // accumulated existing TrackLines.txt
 static String gDxfRawSample;            // first ~16 KB of raw DXF, saved to LittleFS
 static String gDxfCrsUsed;              // v1.5.8: which dxfCrs= the last upload was reframed under
+static String gDxfDatumUsed;            // v1.5.9: which dxfDatum= the last upload used (gda94/gda2020)
+static double gDxfOffsetEUsed = 0;      // v1.5.9: total E offset applied (datum + manual), source-CRS metres
+static double gDxfOffsetNUsed = 0;      // v1.5.9: total N offset applied (datum + manual), source-CRS metres
 
 static void dxfUploadBegin() {
   gDxfUploadOk = false;
@@ -3274,6 +3340,19 @@ void handleDxfUploadEnd() {
   //   mga56   — force UTM zone 56 (Australia 150°E–156°E)
   //   local   — DXF already in metres E/N from anchor; skip projection
   //   latlon  — DXF X=lon, Y=lat (degrees); project via latLonToLocal
+  //
+  // v1.5.9: ?dxfDatum= and ?dxfOffsetE=/?dxfOffsetN= compose a single
+  // shift in source-CRS easting/northing applied BEFORE the inverse
+  // projection. dxfDatum=gda94 adds (+1.6 E, +1.0 N) — coarse plate-
+  // motion constant for GDA94→GDA2020 at Sunraysia latitude (≈-34°S);
+  // strictly the official correction is the ICSM NTv2 grid file, but
+  // for a 3 m tree spacing the constant is fine to ~5 cm. dxfDatum=
+  // gda2020 (default) is a no-op. dxfOffsetE/N are decimal-metre
+  // nudges for diagnosing surveyor-side coordinate mismatches that
+  // no datum shift explains (wrong control point, adjacent block).
+  // Both compose: total = datum + manual. For crs=local we apply the
+  // sum directly in the local frame; for crs=latlon we convert metres
+  // to lat/lon equivalents at gAnchorLat and add to the degree values.
   {
     String crs = webServer.arg("dxfCrs");
     if (crs.length() == 0) crs = "auto";
@@ -3288,35 +3367,73 @@ void handleDxfUploadEnd() {
       crs = "auto";
       zone = (int)floor((gAnchorLon + 180.0) / 6.0) + 1;
     }
+
+    String datum = webServer.arg("dxfDatum");
+    if (datum.length() == 0) datum = "gda2020";
+    double datumE = 0, datumN = 0;
+    if (datum == "gda94") {
+      datumE = 1.6; datumN = 1.0;     // GDA94 → GDA2020 at -34°S, ±5 cm.
+    } else if (datum != "gda2020") {
+      Serial.printf("[DXF] unknown dxfDatum='%s' — falling back to gda2020\n", datum.c_str());
+      datum = "gda2020";
+    }
+
+    String osE = webServer.arg("dxfOffsetE");
+    String osN = webServer.arg("dxfOffsetN");
+    double manualE = osE.length() ? osE.toDouble() : 0.0;
+    double manualN = osN.length() ? osN.toDouble() : 0.0;
+
+    double offsetE = datumE + manualE;
+    double offsetN = datumN + manualN;
+
     float preX1=0, preY1=0, preX2=0, preY2=0;
     if (gDxfLineCount > 0) {
       preX1 = gDxfLines[0].x1; preY1 = gDxfLines[0].y1;
       preX2 = gDxfLines[0].x2; preY2 = gDxfLines[0].y2;
     }
-    Serial.printf("[DXF] re-framing %d segments: dxfCrs=%s zone=%d anchor=(%.7f,%.7f)\n",
-                  gDxfLineCount, crs.c_str(), zone, gAnchorLat, gAnchorLon);
+    Serial.printf("[DXF] re-framing %d segments: dxfCrs=%s zone=%d datum=%s "
+                  "offset=(%+.3fE,%+.3fN) [datum=%+.3fE/%+.3fN, manual=%+.3fE/%+.3fN] "
+                  "anchor=(%.7f,%.7f)\n",
+                  gDxfLineCount, crs.c_str(), zone, datum.c_str(),
+                  offsetE, offsetN, datumE, datumN, manualE, manualN,
+                  gAnchorLat, gAnchorLon);
     Serial.printf("[DXF]   pre-reframe seg[0]: (%.3f,%.3f)->(%.3f,%.3f)\n",
                   (double)preX1, (double)preY1, (double)preX2, (double)preY2);
+
     if (crs == "local") {
-      // Already in local E/N — no transform needed.
+      // Already in local E/N — apply offset directly in the local frame.
+      if (offsetE != 0 || offsetN != 0) {
+        for (int i = 0; i < gDxfLineCount; i++) {
+          DxfLine& L = gDxfLines[i];
+          L.x1 += (float)offsetE; L.y1 += (float)offsetN;
+          L.x2 += (float)offsetE; L.y2 += (float)offsetN;
+        }
+      }
     } else if (crs == "latlon") {
+      // X=longitude, Y=latitude (degrees). Convert offset metres to
+      // degrees at the anchor latitude before adding.
+      double offsetLat = offsetN / 111320.0;
+      double offsetLon = (offsetE != 0)
+                       ? offsetE / (111320.0 * cos(gAnchorLat * M_PI / 180.0))
+                       : 0.0;
       for (int i = 0; i < gDxfLineCount; i++) {
         DxfLine& L = gDxfLines[i];
         double le, ln;
-        // X=longitude, Y=latitude (degrees).
-        latLonToLocal((double)L.y1, (double)L.x1, le, ln);
+        latLonToLocal((double)L.y1 + offsetLat, (double)L.x1 + offsetLon, le, ln);
         L.x1 = (float)le; L.y1 = (float)ln;
-        latLonToLocal((double)L.y2, (double)L.x2, le, ln);
+        latLonToLocal((double)L.y2 + offsetLat, (double)L.x2 + offsetLon, le, ln);
         L.x2 = (float)le; L.y2 = (float)ln;
       }
     } else {
+      // UTM/MGA easting/northing — add offset before the inverse
+      // projection so the shift is in the surveyor's source frame.
       for (int i = 0; i < gDxfLineCount; i++) {
         DxfLine& L = gDxfLines[i];
         double lat, lon, le, ln;
-        utmToLatLon((double)L.x1, (double)L.y1, zone, lat, lon);
+        utmToLatLon((double)L.x1 + offsetE, (double)L.y1 + offsetN, zone, lat, lon);
         latLonToLocal(lat, lon, le, ln);
         L.x1 = (float)le; L.y1 = (float)ln;
-        utmToLatLon((double)L.x2, (double)L.y2, zone, lat, lon);
+        utmToLatLon((double)L.x2 + offsetE, (double)L.y2 + offsetN, zone, lat, lon);
         latLonToLocal(lat, lon, le, ln);
         L.x2 = (float)le; L.y2 = (float)ln;
       }
@@ -3326,7 +3443,10 @@ void handleDxfUploadEnd() {
       Serial.printf("[DXF]   post-reframe seg[0]: (%.3f,%.3f)->(%.3f,%.3f)\n",
                     (double)post.x1, (double)post.y1, (double)post.x2, (double)post.y2);
     }
-    gDxfCrsUsed = crs;
+    gDxfCrsUsed     = crs;
+    gDxfDatumUsed   = datum;
+    gDxfOffsetEUsed = offsetE;
+    gDxfOffsetNUsed = offsetN;
   }
 
   // Classify (auto-detect two perpendicular bearings), build intersections,
@@ -3402,6 +3522,7 @@ void handleDxfUploadEnd() {
   char out[2048];
   snprintf(out, sizeof(out),
     "{\"ok\":true,\"anchorSrc\":\"%s\",\"dxfCrs\":\"%s\","
+    "\"dxfDatum\":\"%s\",\"dxfOffsetE\":%.3f,\"dxfOffsetN\":%.3f,"
     "\"field\":{\"anchorLat\":%.7f,\"anchorLon\":%.7f},"
     "\"rowLayer\":\"%s\",\"treeLayer\":\"%s\","
     "\"rowLines\":%d,\"treeLines\":%d,"
@@ -3421,6 +3542,7 @@ void handleDxfUploadEnd() {
                   "\"totalSegments\":%d,\"keptSegments\":%d},"
     "\"mode\":%d,\"source\":%d}",
     anchorSrc.c_str(), gDxfCrsUsed.c_str(),
+    gDxfDatumUsed.c_str(), gDxfOffsetEUsed, gDxfOffsetNUsed,
     gAnchorLat, gAnchorLon,
     gRowLayer, gTreeLayer,
     gRowCount, gTreeCount,
