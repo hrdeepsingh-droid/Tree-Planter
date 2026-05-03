@@ -69,6 +69,57 @@
 //         tree-points loop silently skipped, the map fell through to
 //         the empty simple-mode grid[][] and showed nothing. Now gates
 //         on (numIntersections > 0), so DXF-derived trees render too.
+// 1.5.8 — Five fixes for DXF-imported orchard grids, all uncovered on
+//         the first real-world upload:
+//         (1) Selectable DXF coordinate system. v1.5.5/.7 auto-picked
+//             the UTM zone from anchor longitude, which silently mis-
+//             projected surveys exported in a neighbouring MGA zone
+//             (a Mildura block delivered in MGA54 when the anchor sat
+//             in MGA55, or vice versa near the 144°E zone boundary).
+//             /field/dxf now accepts ?dxfCrs=auto|mga54|mga55|mga56|
+//             local|latlon — local skips projection entirely (DXF
+//             already in metres E/N from anchor), latlon treats X=lon/
+//             Y=lat (degrees). A <select> below the outer-row/outer-
+//             tree fields drives it; first-segment coords are printed
+//             before and after re-frame for diagnosis.
+//         (2) buildDxfIntersections() row/tree clamps removed. The
+//             20-row / 100-tree caps were leftovers from the simple/
+//             AB-mode form-field caps and were silently wrong on real
+//             orchard blocks: a 25×80 DXF clamped gNumTrees to 80 but
+//             numIntersections stayed at 2,000, so /api/grid's
+//             row=i/treesPerRow indexing wrapped past the last row and
+//             every intersection beyond #1599 had a bogus row index.
+//             The 32K MAX_INTERSECTIONS cap (PSRAM) is the only ceiling
+//             that matters now.
+//         (3) checkGrid() fire gate fixed. The MODE_AB branch read
+//             `if (!gHasLines || !gHasField || numIntersections == 0)
+//             return;`, but DXF upload sets gHasLines=false (no AB-line
+//             recipe to apply), so the relay never fired from a DXF-
+//             derived grid. Same bug pattern as v1.5.4's /api/grid
+//             render fix. Now requires gHasLines only when the source
+//             actually is SRC_ABLINES.
+//         (4) /api/grid rowLine/treeLine overlay also gated on
+//             gHasLines — third instance of the same bug. For SRC_DXF
+//             we now draw from gEdgeRow*/gEdgeTree* (the picked outer
+//             edges, already in local E/N) so the dashboard map shows
+//             the same two endpoints that TrackLines.txt was built
+//             from. The user can visually confirm the export traces
+//             the orchard rows before loading into AOG.
+//         (5) Anchor-vs-StartFix diagnostic. TrackLines.txt is written
+//             in metres-from-anchor; AOG reads it as metres-from-
+//             StartFix. If those two anchors differ (manual upload
+//             anchor that doesn't match the AOG field's StartFix, or
+//             a Field.txt from a different field accidentally
+//             attached), every track point lands shifted by the
+//             offset (0.0001° ≈ 11 m) and the trackline sits off the
+//             row even though the row itself plots correctly. The
+//             upload response now includes edgeEnds (row+tree edge
+//             endpoints in BOTH local-metres and lat/lon) and
+//             anchorVsField (parsed StartFix + Δlat/Δlon/Δm vs the
+//             anchor in use). The dashboard shows a red warning in
+//             the upload status pane when |Δm| > 1m. Field.txt is
+//             also forwarded in manual mode so the diagnostic works
+//             without switching modes.
 // 1.5.3 — DXF fixes from real-world test: (1) bearing centroid now uses
 //         circular mean on doubled angle (sum of cos 2θ / sin 2θ), so
 //         clusters straddling the 0°/180° wrap collapse instead of being
@@ -84,7 +135,7 @@
 //         as grid" that switches source and scrolls to the upload card;
 //         (5) numIntersections / gNumRows / gNumTrees are zeroed on every
 //         /field/apply so old dots don't bleed through after a mode swap.
-#define FW_VERSION "1.5.7"
+#define FW_VERSION "1.5.8"
 
 // ================================================================
 //  COMPILED-IN DEFAULTS — overridden by Preferences after first save
@@ -693,6 +744,16 @@ main{max-width:920px;margin:0 auto;padding:22px 20px 48px}
       <div class=fg><label>Outer-row line name</label><input id=fd-erow type=text value=DXF-Row-Edge></div>
       <div class=fg><label>Outer-tree line name</label><input id=fd-etree type=text value=DXF-Tree-Edge></div>
     </div>
+    <div class=fg><label>DXF coordinate system</label>
+      <select id=fd-crs>
+        <option value=auto selected>Auto (UTM zone from anchor longitude)</option>
+        <option value=mga54>MGA Zone 54 (138&deg;E&ndash;144&deg;E)</option>
+        <option value=mga55>MGA Zone 55 (144&deg;E&ndash;150&deg;E)</option>
+        <option value=mga56>MGA Zone 56 (150&deg;E&ndash;156&deg;E)</option>
+        <option value=local>Local metres (already E/N from anchor)</option>
+        <option value=latlon>Lat/Lon (X=longitude, Y=latitude, degrees)</option>
+      </select>
+    </div>
     <div class=fg><label>Existing TrackLines.txt <span style="color:var(--mu);font-weight:400;text-transform:none;letter-spacing:0">(optional &mdash; merge into)</span></label><input id=fd-trk type=file accept=".txt"></div>
     <button class="btn btn-p" onclick=dxfUpload()><span>Upload DXF &amp; Apply</span><span class=bi>&#8593;</span></button>
     <button class="btn btn-g" id=fd-dl-trk onclick=downloadTracklines() disabled><span>Download TrackLines.txt</span><span class=bi>&#8659;</span></button>
@@ -1000,13 +1061,16 @@ var dxfUpload=async ()=>{
   var qs='anchorSrc='+encodeURIComponent(src);
   var fd=new FormData();
   fd.append('dxf',dxf);
+  var ft=document.getElementById('fd-dxf-ft').files[0];
   if(src=='manual'){
     var la=document.getElementById('fd-alat').value.trim();
     var lo=document.getElementById('fd-alon').value.trim();
     if(!la||!lo){alert('Fill anchor lat and lon');return;}
     qs+='&lat='+encodeURIComponent(la)+'&lon='+encodeURIComponent(lo);
+    // v1.5.8: forward Field.txt even in manual mode so the server can
+    // diagnose anchor-vs-StartFix mismatch (drives the trackline-shift hint).
+    if(ft)fd.append('field',ft);
   } else {
-    var ft=document.getElementById('fd-dxf-ft').files[0];
     if(!ft){alert('Pick Field.txt (or switch to Manual)');return;}
     fd.append('field',ft);
   }
@@ -1014,10 +1078,12 @@ var dxfUpload=async ()=>{
   var tl=document.getElementById('fd-tlyr').value.trim();
   var er=document.getElementById('fd-erow').value.trim();
   var et=document.getElementById('fd-etree').value.trim();
+  var crs=document.getElementById('fd-crs').value;
   if(rl)qs+='&rowLayer='+encodeURIComponent(rl);
   if(tl)qs+='&treeLayer='+encodeURIComponent(tl);
   if(er)qs+='&edgeRow='+encodeURIComponent(er);
   if(et)qs+='&edgeTree='+encodeURIComponent(et);
+  if(crs)qs+='&dxfCrs='+encodeURIComponent(crs);
   var trk=document.getElementById('fd-trk').files[0];
   if(trk)fd.append('tracklines',trk);
   st.style.color='';
@@ -1035,8 +1101,26 @@ var dxfUpload=async ()=>{
       msg+=d.intersections+' intersections ('+d.rowLines+' rows × '+d.treeLines+' trees)';
       if(d.overflow)msg+=' — OVERFLOW, some skipped';
       msg+='. Anchor '+d.field.anchorLat.toFixed(7)+','+d.field.anchorLon.toFixed(7);
+      if(d.dxfCrs)msg+=' (CRS '+d.dxfCrs+')';
       msg+='. Edges: '+d.edge.row+' ('+d.edge.rowHdg.toFixed(1)+'°), '+d.edge.tree+' ('+d.edge.treeHdg.toFixed(1)+'°).';
       msg+=' TrackLines '+(d.tracklinesMerged?'merged':'stub')+' ('+d.trackBytes+' bytes).';
+      // v1.5.8: anchor-vs-StartFix mismatch hint. AOG reads TrackLines.txt
+      // in metres-from-StartFix; if the upload anchor differs, every
+      // exported point is shifted by mDelta — the row plots fine but the
+      // trackline lands off it. >1m is well past GPS noise; flag it.
+      if(d.anchorVsField&&d.anchorVsField.present){
+        var av=d.anchorVsField;
+        if(av.mDelta>1.0){
+          st.style.color='var(--er)';
+          msg+=' WARNING: upload anchor differs from Field.txt StartFix by '
+              +av.mDelta.toFixed(2)+'m ('+av.latDelta.toFixed(7)+'°,'
+              +av.lonDelta.toFixed(7)+'°). Exported TrackLines will sit '
+              +av.mDelta.toFixed(2)+'m off the planted rows in AOG — '
+              +'re-upload using the same Field.txt AOG loaded for this field.';
+        } else {
+          msg+=' Anchor matches Field.txt StartFix (Δ='+av.mDelta.toFixed(2)+'m).';
+        }
+      }
       st.textContent=msg;
       document.getElementById('fd-dl-trk').disabled=false;
       fetchField();poll();refreshMapGrid();
@@ -1407,7 +1491,14 @@ void checkGrid(double lat, double lon) {
   double nearD = 1e9;
 
   if (gGridMode == MODE_AB) {
-    if (!gHasLines || !gHasField || numIntersections == 0) return;
+    // v1.5.8: gate fixed — gHasLines is the AB-line recipe flag and is
+    // false after a DXF upload (DXF builds intersections directly, with
+    // no AB-line resolution step). Same bug pattern as v1.5.4's
+    // /api/grid render fix: gHasLines was silently disqualifying every
+    // DXF-derived grid from firing. We now require the AOG ABLines
+    // recipe only when the source actually is ABLines.
+    if (!gHasField || numIntersections == 0) return;
+    if (gGridSource == SRC_ABLINES && !gHasLines) return;
     double le, ln;
     latLonToLocal(lat, lon, le, ln);
     for (int i = 0; i < numIntersections; i++) {
@@ -2234,11 +2325,16 @@ static bool buildDxfIntersections() {
   }
   // For AB-mode indexing (row = i/gNumTrees, tree = i%gNumTrees) the
   // dashboard needs gNumRows/gNumTrees set. Use the classified counts.
+  // v1.5.8: dropped the 20-row / 100-tree clamps. They were leftovers
+  // from the simple/AB-mode form-field caps and silently wrong on real
+  // orchard blocks: a 25×80 DXF would clamp gNumTrees to 80 but
+  // numIntersections would still be 2,000, so /api/grid's
+  // row=i/treesPerRow indexing wrapped past the last row and nothing
+  // beyond intersection #1599 had a valid row index. The 32K
+  // MAX_INTERSECTIONS cap (PSRAM) is the only ceiling that matters.
   if (gTreeCount > 0) {
     gNumRows  = gRowCount;
     gNumTrees = gTreeCount;
-    if (gNumRows  > 20)  gNumRows  = 20;
-    if (gNumTrees > 100) gNumTrees = 100;
   }
   Serial.printf("[DXF] Built %d intersections (%d rows × %d trees, raw=%d, overflow=%d)\n",
                 numIntersections, gRowCount, gTreeCount, lastRawIntersections, overflow ? 1 : 0);
@@ -3020,6 +3116,7 @@ static bool   gDxfUploadSeen = false;   // saw the dxf file at all
 static String gDxfFieldTxt;             // accumulated Field.txt (form field "field")
 static String gDxfTracklines;           // accumulated existing TrackLines.txt
 static String gDxfRawSample;            // first ~16 KB of raw DXF, saved to LittleFS
+static String gDxfCrsUsed;              // v1.5.8: which dxfCrs= the last upload was reframed under
 
 static void dxfUploadBegin() {
   gDxfUploadOk = false;
@@ -3156,29 +3253,80 @@ void handleDxfUploadEnd() {
   gAnchorLat = aLat; gAnchorLon = aLon; gHasField = true;
 
   // v1.5.5: Re-frame the parsed DXF segments to AgOpenGPS local frame.
-  // CAD output is in projected metres (UTM/MGA easting/northing). AOG's
-  // local frame, however, is flat-Earth-from-StartFix using metres-per-
-  // degree (≈111,320 × cos(lat) for east, ≈111,320 for north), NOT raw
-  // UTM. The two frames diverge with distance from anchor (~0.04% scale
-  // difference, ~1.2 m at 3 km) — enough to throw a tractor off a 3 m
-  // tree row. v1.5.3 used a raw MGA subtract which preserved that
-  // mismatch. Now we invert each DXF endpoint MGA → lat/lon, then
-  // convert to AOG local frame via latLonToLocal so intersections,
-  // TrackLines.txt, and map markers all share the frame AOG uses.
+  // CAD output is typically in projected metres (UTM/MGA easting/northing).
+  // AOG's local frame, however, is flat-Earth-from-StartFix using metres-
+  // per-degree (≈111,320 × cos(lat) for east, ≈111,320 for north), NOT
+  // raw UTM. The two frames diverge with distance from anchor (~0.04%
+  // scale difference, ~1.2 m at 3 km) — enough to throw a tractor off a
+  // 3 m tree row. v1.5.3 used a raw MGA subtract which preserved that
+  // mismatch. We invert each DXF endpoint to lat/lon, then convert to AOG
+  // local frame via latLonToLocal so intersections, TrackLines.txt, and
+  // map markers all share the frame AOG uses.
+  //
+  // v1.5.8: ?dxfCrs= selects how to interpret the DXF X/Y. v1.5.5/.7
+  // hardcoded zone-from-anchor-longitude, which silently mis-projected
+  // surveys exported in a neighbouring MGA zone (e.g. a Mildura block
+  // delivered in MGA54 when the anchor sits in MGA55, or vice versa near
+  // the 144°E zone boundary).
+  //   auto    — pick UTM zone from anchor longitude (v1.5.5/.7 behaviour)
+  //   mga54   — force UTM zone 54 (Australia 138°E–144°E)
+  //   mga55   — force UTM zone 55 (Australia 144°E–150°E)
+  //   mga56   — force UTM zone 56 (Australia 150°E–156°E)
+  //   local   — DXF already in metres E/N from anchor; skip projection
+  //   latlon  — DXF X=lon, Y=lat (degrees); project via latLonToLocal
   {
-    int zone = (int)floor((gAnchorLon + 180.0) / 6.0) + 1;
-    Serial.printf("[DXF] re-framing %d segments to AOG local frame: zone=%d anchor=(%.7f,%.7f)\n",
-                  gDxfLineCount, zone, gAnchorLat, gAnchorLon);
-    for (int i = 0; i < gDxfLineCount; i++) {
-      DxfLine& L = gDxfLines[i];
-      double lat, lon, le, ln;
-      utmToLatLon((double)L.x1, (double)L.y1, zone, lat, lon);
-      latLonToLocal(lat, lon, le, ln);
-      L.x1 = (float)le; L.y1 = (float)ln;
-      utmToLatLon((double)L.x2, (double)L.y2, zone, lat, lon);
-      latLonToLocal(lat, lon, le, ln);
-      L.x2 = (float)le; L.y2 = (float)ln;
+    String crs = webServer.arg("dxfCrs");
+    if (crs.length() == 0) crs = "auto";
+    int zone = 0;
+    if      (crs == "mga54") zone = 54;
+    else if (crs == "mga55") zone = 55;
+    else if (crs == "mga56") zone = 56;
+    else if (crs == "auto")  zone = (int)floor((gAnchorLon + 180.0) / 6.0) + 1;
+    else if (crs == "local" || crs == "latlon") zone = 0;
+    else {
+      Serial.printf("[DXF] unknown dxfCrs='%s' — falling back to auto\n", crs.c_str());
+      crs = "auto";
+      zone = (int)floor((gAnchorLon + 180.0) / 6.0) + 1;
     }
+    float preX1=0, preY1=0, preX2=0, preY2=0;
+    if (gDxfLineCount > 0) {
+      preX1 = gDxfLines[0].x1; preY1 = gDxfLines[0].y1;
+      preX2 = gDxfLines[0].x2; preY2 = gDxfLines[0].y2;
+    }
+    Serial.printf("[DXF] re-framing %d segments: dxfCrs=%s zone=%d anchor=(%.7f,%.7f)\n",
+                  gDxfLineCount, crs.c_str(), zone, gAnchorLat, gAnchorLon);
+    Serial.printf("[DXF]   pre-reframe seg[0]: (%.3f,%.3f)->(%.3f,%.3f)\n",
+                  (double)preX1, (double)preY1, (double)preX2, (double)preY2);
+    if (crs == "local") {
+      // Already in local E/N — no transform needed.
+    } else if (crs == "latlon") {
+      for (int i = 0; i < gDxfLineCount; i++) {
+        DxfLine& L = gDxfLines[i];
+        double le, ln;
+        // X=longitude, Y=latitude (degrees).
+        latLonToLocal((double)L.y1, (double)L.x1, le, ln);
+        L.x1 = (float)le; L.y1 = (float)ln;
+        latLonToLocal((double)L.y2, (double)L.x2, le, ln);
+        L.x2 = (float)le; L.y2 = (float)ln;
+      }
+    } else {
+      for (int i = 0; i < gDxfLineCount; i++) {
+        DxfLine& L = gDxfLines[i];
+        double lat, lon, le, ln;
+        utmToLatLon((double)L.x1, (double)L.y1, zone, lat, lon);
+        latLonToLocal(lat, lon, le, ln);
+        L.x1 = (float)le; L.y1 = (float)ln;
+        utmToLatLon((double)L.x2, (double)L.y2, zone, lat, lon);
+        latLonToLocal(lat, lon, le, ln);
+        L.x2 = (float)le; L.y2 = (float)ln;
+      }
+    }
+    if (gDxfLineCount > 0) {
+      const DxfLine& post = gDxfLines[0];
+      Serial.printf("[DXF]   post-reframe seg[0]: (%.3f,%.3f)->(%.3f,%.3f)\n",
+                    (double)post.x1, (double)post.y1, (double)post.x2, (double)post.y2);
+    }
+    gDxfCrsUsed = crs;
   }
 
   // Classify (auto-detect two perpendicular bearings), build intersections,
@@ -3211,28 +3359,80 @@ void handleDxfUploadEnd() {
   saveAbPrefs();
   saveGridPrefs();      // gNumRows/gNumTrees were updated by buildDxfIntersections
 
+  // v1.5.8: edge endpoints in both local-metres and lat/lon (the same
+  // numbers TrackLines.txt is built from) so the dashboard map can plot
+  // them directly and the user can sanity-check them before loading
+  // into AOG.
+  double erA_lat = 0, erA_lon = 0, erB_lat = 0, erB_lon = 0;
+  double etA_lat = 0, etA_lon = 0, etB_lat = 0, etB_lon = 0;
+  if (gHasEdges) {
+    localToLatLon((double)gEdgeRowX1,  (double)gEdgeRowY1,  erA_lat, erA_lon);
+    localToLatLon((double)gEdgeRowX2,  (double)gEdgeRowY2,  erB_lat, erB_lon);
+    localToLatLon((double)gEdgeTreeX1, (double)gEdgeTreeY1, etA_lat, etA_lon);
+    localToLatLon((double)gEdgeTreeX2, (double)gEdgeTreeY2, etB_lat, etB_lon);
+  }
+
+  // v1.5.8: anchor-vs-StartFix diagnostic. TrackLines.txt is written in
+  // metres-from-anchor (gAnchor*) — but AOG reads it as metres-from-
+  // StartFix. If those two anchors differ (manual upload anchor that
+  // doesn't match the AOG field's StartFix, or a Field.txt from a
+  // different field accidentally attached), every track point is
+  // shifted by that offset (0.0001° ≈ 11 m) and the trackline lands
+  // off the row even though the row itself plots correctly. We always
+  // attempt to parse the Field.txt if the user attached one (the JS
+  // forwards it in manual mode too as of v1.5.8) and surface the
+  // delta in the response so the dashboard can show a warning.
+  bool   fieldParsed   = false;
+  double fieldStartLat = 0, fieldStartLon = 0;
+  double anchorDLat    = 0, anchorDLon    = 0, anchorDM = 0;
+  if (gDxfFieldTxt.length() > 0 &&
+      parseFieldTxt(gDxfFieldTxt, fieldStartLat, fieldStartLon)) {
+    fieldParsed = true;
+    anchorDLat = fieldStartLat - gAnchorLat;
+    anchorDLon = fieldStartLon - gAnchorLon;
+    const double MPD = 111320.0;
+    double dN = anchorDLat * MPD;
+    double dE = anchorDLon * MPD * cos(gAnchorLat * M_PI / 180.0);
+    anchorDM = sqrt(dN*dN + dE*dE);
+  }
+
   // Build JSON response
-  char out[1024];
+  // v1.5.8: buffer grew from 1024→2048 to fit the new edgeEnds and
+  // anchorVsField sections — the old size was already ~80% full.
+  char out[2048];
   snprintf(out, sizeof(out),
-    "{\"ok\":true,\"anchorSrc\":\"%s\","
+    "{\"ok\":true,\"anchorSrc\":\"%s\",\"dxfCrs\":\"%s\","
     "\"field\":{\"anchorLat\":%.7f,\"anchorLon\":%.7f},"
     "\"rowLayer\":\"%s\",\"treeLayer\":\"%s\","
     "\"rowLines\":%d,\"treeLines\":%d,"
     "\"intersections\":%d,\"rawIntersections\":%d,"
     "\"overflow\":%s,\"badLines\":%d,"
     "\"edge\":{\"row\":\"%s\",\"rowHdg\":%.3f,\"tree\":\"%s\",\"treeHdg\":%.3f},"
+    "\"edgeEnds\":{"
+      "\"row\":{\"local\":[%.3f,%.3f,%.3f,%.3f],"
+              "\"latlon\":[[%.7f,%.7f],[%.7f,%.7f]]},"
+      "\"tree\":{\"local\":[%.3f,%.3f,%.3f,%.3f],"
+               "\"latlon\":[[%.7f,%.7f],[%.7f,%.7f]]}},"
+    "\"anchorVsField\":{\"present\":%s,\"startLat\":%.7f,\"startLon\":%.7f,"
+      "\"latDelta\":%.7f,\"lonDelta\":%.7f,\"mDelta\":%.3f},"
     "\"tracklinesMerged\":%s,\"trackBytes\":%d,"
     "\"detected\":{\"bearingRow\":%.2f,\"bearingTree\":%.2f,"
                   "\"spacingRow\":%.2f,\"spacingTree\":%.2f,"
                   "\"totalSegments\":%d,\"keptSegments\":%d},"
     "\"mode\":%d,\"source\":%d}",
-    anchorSrc.c_str(),
+    anchorSrc.c_str(), gDxfCrsUsed.c_str(),
     gAnchorLat, gAnchorLon,
     gRowLayer, gTreeLayer,
     gRowCount, gTreeCount,
     numIntersections, lastRawIntersections,
     overflow ? "true" : "false", gDxfBadLines,
     gEdgeRowName, gEdgeRowHdg, gEdgeTreeName, gEdgeTreeHdg,
+    (double)gEdgeRowX1, (double)gEdgeRowY1, (double)gEdgeRowX2, (double)gEdgeRowY2,
+    erA_lat, erA_lon, erB_lat, erB_lon,
+    (double)gEdgeTreeX1, (double)gEdgeTreeY1, (double)gEdgeTreeX2, (double)gEdgeTreeY2,
+    etA_lat, etA_lon, etB_lat, etB_lon,
+    fieldParsed ? "true" : "false", fieldStartLat, fieldStartLon,
+    anchorDLat, anchorDLon, anchorDM,
     (gDxfTracklines.length() > 0) ? "true" : "false",
     (int)gTrackLinesOut.length(),
     gDetectedBearingA, gDetectedBearingB,
@@ -3356,37 +3556,63 @@ void handleGrid() {
 
   // AB-line segments so the dashboard can overlay them on the map and
   // the user can see whether the Row/Tree lines match the actual trees.
-  // Each segment starts ~one spacing-unit before the grid origin and
-  // extends one spacing-unit beyond the last tree/row for visibility.
+  // For SRC_ABLINES, each segment starts ~one spacing-unit before the
+  // grid origin and extends one spacing-unit beyond the last tree/row.
+  // For SRC_DXF, the picked outer edges (gEdgeRow*/gEdgeTree*) are
+  // already two endpoints in local E/N — emit them verbatim so the user
+  // can visually confirm the exported TrackLines actually trace the
+  // orchard rows on the dashboard map before loading into AOG.
+  // v1.5.8: previously this whole block was gated on gHasLines (the AB-
+  // line recipe flag), so DXF-source grids drew no overlay at all —
+  // same root cause as v1.5.4's /api/grid points fix and v1.5.8's
+  // checkGrid() fire-gate fix.
   webServer.sendContent("],\"rowLine\":[");
-  if (gGridMode == MODE_AB && gHasLines && gHasField) {
-    double rowHdgR = gRowHdg * M_PI / 180.0;
-    double dE = sin(rowHdgR), dN = cos(rowHdgR);
-    double extent = (double)(gNumTrees > 1 ? gNumTrees - 1 : 1) * gTreeSpacing;
-    double pad = (extent < 10.0) ? 10.0 : extent * 0.1;
-    double aE = gAbOriginE - pad * dE, aN = gAbOriginN - pad * dN;
-    double bE = gAbOriginE + (extent + pad) * dE, bN = gAbOriginN + (extent + pad) * dN;
-    double lat1, lon1, lat2, lon2;
-    localToLatLon(aE, aN, lat1, lon1);
-    localToLatLon(bE, bN, lat2, lon2);
-    pos = snprintf(chunk, sizeof(chunk), "[%.7f,%.7f],[%.7f,%.7f]",
-                   lat1, lon1, lat2, lon2);
-    webServer.sendContent(chunk, pos); pos = 0;
+  if (gGridMode == MODE_AB && gHasField) {
+    if (gGridSource == SRC_DXF && gHasEdges) {
+      double lat1, lon1, lat2, lon2;
+      localToLatLon((double)gEdgeRowX1, (double)gEdgeRowY1, lat1, lon1);
+      localToLatLon((double)gEdgeRowX2, (double)gEdgeRowY2, lat2, lon2);
+      pos = snprintf(chunk, sizeof(chunk), "[%.7f,%.7f],[%.7f,%.7f]",
+                     lat1, lon1, lat2, lon2);
+      webServer.sendContent(chunk, pos); pos = 0;
+    } else if (gGridSource == SRC_ABLINES && gHasLines) {
+      double rowHdgR = gRowHdg * M_PI / 180.0;
+      double dE = sin(rowHdgR), dN = cos(rowHdgR);
+      double extent = (double)(gNumTrees > 1 ? gNumTrees - 1 : 1) * gTreeSpacing;
+      double pad = (extent < 10.0) ? 10.0 : extent * 0.1;
+      double aE = gAbOriginE - pad * dE, aN = gAbOriginN - pad * dN;
+      double bE = gAbOriginE + (extent + pad) * dE, bN = gAbOriginN + (extent + pad) * dN;
+      double lat1, lon1, lat2, lon2;
+      localToLatLon(aE, aN, lat1, lon1);
+      localToLatLon(bE, bN, lat2, lon2);
+      pos = snprintf(chunk, sizeof(chunk), "[%.7f,%.7f],[%.7f,%.7f]",
+                     lat1, lon1, lat2, lon2);
+      webServer.sendContent(chunk, pos); pos = 0;
+    }
   }
   webServer.sendContent("],\"treeLine\":[");
-  if (gGridMode == MODE_AB && gHasLines && gHasField) {
-    double treeHdgR = gTreeHdg * M_PI / 180.0;
-    double dE = sin(treeHdgR), dN = cos(treeHdgR);
-    double extent = (double)(gNumRows > 1 ? gNumRows - 1 : 1) * gRowSpacing;
-    double pad = (extent < 10.0) ? 10.0 : extent * 0.1;
-    double aE = gAbOriginE - pad * dE, aN = gAbOriginN - pad * dN;
-    double bE = gAbOriginE + (extent + pad) * dE, bN = gAbOriginN + (extent + pad) * dN;
-    double lat1, lon1, lat2, lon2;
-    localToLatLon(aE, aN, lat1, lon1);
-    localToLatLon(bE, bN, lat2, lon2);
-    pos = snprintf(chunk, sizeof(chunk), "[%.7f,%.7f],[%.7f,%.7f]",
-                   lat1, lon1, lat2, lon2);
-    webServer.sendContent(chunk, pos); pos = 0;
+  if (gGridMode == MODE_AB && gHasField) {
+    if (gGridSource == SRC_DXF && gHasEdges) {
+      double lat1, lon1, lat2, lon2;
+      localToLatLon((double)gEdgeTreeX1, (double)gEdgeTreeY1, lat1, lon1);
+      localToLatLon((double)gEdgeTreeX2, (double)gEdgeTreeY2, lat2, lon2);
+      pos = snprintf(chunk, sizeof(chunk), "[%.7f,%.7f],[%.7f,%.7f]",
+                     lat1, lon1, lat2, lon2);
+      webServer.sendContent(chunk, pos); pos = 0;
+    } else if (gGridSource == SRC_ABLINES && gHasLines) {
+      double treeHdgR = gTreeHdg * M_PI / 180.0;
+      double dE = sin(treeHdgR), dN = cos(treeHdgR);
+      double extent = (double)(gNumRows > 1 ? gNumRows - 1 : 1) * gRowSpacing;
+      double pad = (extent < 10.0) ? 10.0 : extent * 0.1;
+      double aE = gAbOriginE - pad * dE, aN = gAbOriginN - pad * dN;
+      double bE = gAbOriginE + (extent + pad) * dE, bN = gAbOriginN + (extent + pad) * dN;
+      double lat1, lon1, lat2, lon2;
+      localToLatLon(aE, aN, lat1, lon1);
+      localToLatLon(bE, bN, lat2, lon2);
+      pos = snprintf(chunk, sizeof(chunk), "[%.7f,%.7f],[%.7f,%.7f]",
+                     lat1, lon1, lat2, lon2);
+      webServer.sendContent(chunk, pos); pos = 0;
+    }
   }
   webServer.sendContent("]}");
   webServer.sendContent("");  // end of chunked transfer
