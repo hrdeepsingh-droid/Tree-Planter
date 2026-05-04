@@ -175,7 +175,34 @@
 //         as grid" that switches source and scrolls to the upload card;
 //         (5) numIntersections / gNumRows / gNumTrees are zeroed on every
 //         /field/apply so old dots don't bleed through after a mode swap.
-#define FW_VERSION "1.5.9"
+// 1.6.0 — CSV tree-grid upload: new /field/csv endpoint accepts a flat
+//         point-cloud CSV (header + rows of UTM Easting/Northing) and
+//         populates intersections[] directly. Reuses utmToLatLon()
+//         and latLonToLocal() from the DXF flow but skips DXF's
+//         line-classification step — CSV is point data, not line
+//         geometry, so there are no perpendicular bearing groups to
+//         detect. Row segmentation is done by walking consecutive
+//         points and starting a new row whenever the gap exceeds
+//         rowGap metres (default 30, override via ?rowGap=). The
+//         CSV must therefore be pre-sorted in row-major order: each
+//         row contiguous, with one large XY jump between rows.
+//         New gGridSource SRC_CSV (=2) parallels SRC_DXF; the parsed
+//         intersections cache to NVS as csv_pts. UTM zone is
+//         REQUIRED at upload (?csvCrs=mga54|mga55|mga56) — no
+//         default, the upload 400s if missing — because the wrong
+//         zone silently shifts the grid by hundreds of metres and
+//         we'd rather fail loud than silently mis-project. The
+//         first valid (X,Y) point becomes the field anchor (its
+//         UTM is inverted to lat/lon and stored as gAnchorLat/Lon),
+//         so no Field.txt or manual lat/lon is needed at upload
+//         time. Header parser accepts X/EASTING and Y/NORTHING in
+//         either order, and tolerates extra columns (Index, Z,
+//         etc.) which are ignored. Web UI gets a new card directly
+//         below the DXF card. Hit detection at the existing
+//         (gGridSource == SRC_ABLINES && !gHasLines) gate already
+//         passes SRC_CSV through, so the relay fires on CSV-derived
+//         intersections without further changes.
+#define FW_VERSION "1.6.0"
 
 // ================================================================
 //  COMPILED-IN DEFAULTS — overridden by Preferences after first save
@@ -211,6 +238,7 @@
 // buildAbIntersections() when the source is DXF (no AB lines to resolve).
 #define SRC_ABLINES  0
 #define SRC_DXF      1
+#define SRC_CSV      2
 
 // Default AB-line names (match whatever you saved in AgOpenGPS)
 #define DEF_ROW_NAME   "Row"
@@ -327,6 +355,14 @@ float  gEdgeTreeX1 = 0, gEdgeTreeY1 = 0, gEdgeTreeX2 = 0, gEdgeTreeY2 = 0;
 float  gEdgeRowHdg = 0, gEdgeTreeHdg = 0;
 bool   gHasEdges = false;
 
+// ── CSV-mode state ────────────────────────────────────────────
+// CSV uploads share intersections[] with DXF/AB but cache to a
+// separate NVS key (csv_pts) so flipping back and forth between
+// SRC_DXF and SRC_CSV doesn't trash either cache. The CRS tag is
+// kept in RAM only (re-derivable from the cache by the user) and
+// echoed back in /field/state for diagnostics.
+String gCsvCrsUsed;
+
 // AB-mode geometry (declared up here so loadPrefs can populate them).
 struct IPt { float e; float n; };
 IPt* intersections    = nullptr;   // PSRAM-backed; allocated in setup()
@@ -403,14 +439,21 @@ void loadPrefs() {
   gEdgeTreeX1 = prefs.getFloat("etx1", 0);  gEdgeTreeY1 = prefs.getFloat("ety1", 0);
   gEdgeTreeX2 = prefs.getFloat("etx2", 0);  gEdgeTreeY2 = prefs.getFloat("ety2", 0);
   gEdgeRowHdg = prefs.getFloat("erhdg", 0); gEdgeTreeHdg = prefs.getFloat("ethdg", 0);
-  // When the grid source is DXF, intersections[] isn't rebuilt from
-  // AB-line geometry — it's loaded straight from this cache.
+  // When the grid source is DXF or CSV, intersections[] isn't rebuilt
+  // from AB-line geometry — it's loaded straight from the matching cache.
   numIntersections = 0;
   lastRawIntersections = 0;
   if (gGridSource == SRC_DXF) {
     size_t want = prefs.getBytesLength("dxf_pts");
     if (want > 0 && want <= (size_t)gIntersectionsCap * sizeof(IPt)) {
       prefs.getBytes("dxf_pts", intersections, want);
+      numIntersections = want / sizeof(IPt);
+      lastRawIntersections = numIntersections;
+    }
+  } else if (gGridSource == SRC_CSV) {
+    size_t want = prefs.getBytesLength("csv_pts");
+    if (want > 0 && want <= (size_t)gIntersectionsCap * sizeof(IPt)) {
+      prefs.getBytes("csv_pts", intersections, want);
       numIntersections = want / sizeof(IPt);
       lastRawIntersections = numIntersections;
     }
@@ -479,6 +522,18 @@ void saveAbPrefs() {
   // around so we can reload after the user temporarily switches to AB
   // or Simple. The cache is only ever overwritten by the next successful
   // DXF upload.
+  // v1.6.0: csv_pts follows the same don't-auto-remove rule. Each cache
+  // is only overwritten by the next successful upload of its own kind,
+  // so the user can flip SRC_CSV ⇄ SRC_DXF ⇄ SRC_ABLINES without losing
+  // either grid.
+  if (gGridSource == SRC_CSV && numIntersections > 0) {
+    size_t want = numIntersections * sizeof(IPt);
+    size_t wrote = prefs.putBytes("csv_pts", intersections, want);
+    if (wrote != want) {
+      Serial.printf("[CSV] NVS cache truncated: wrote %u of %u bytes\n",
+                    (unsigned)wrote, (unsigned)want);
+    }
+  }
 
   prefs.end();
 }
@@ -811,6 +866,24 @@ main{max-width:920px;margin:0 auto;padding:22px 20px 48px}
     <button class="btn btn-p" onclick=dxfUpload()><span>Upload DXF &amp; Apply</span><span class=bi>&#8593;</span></button>
     <button class="btn btn-g" id=fd-dl-trk onclick=downloadTracklines() disabled><span>Download TrackLines.txt</span><span class=bi>&#8659;</span></button>
     <p class=note id=fd-dxf-status>Draw your grid as LINE or LWPOLYLINE entities &mdash; rows and trees are auto-detected by line direction (no layer-name match required). Trees are the pairwise intersections of the two perpendicular bearing groups.</p>
+  </div>
+  <div class=card>
+    <div class=clbl>Upload CSV Tree Grid</div>
+    <div class=fg><label>Tree grid CSV (.csv)</label><input id=fd-csv type=file accept=".csv"></div>
+    <div class=g2>
+      <div class=fg><label>UTM Zone <span style="color:var(--er)">*</span></label>
+        <select id=fd-csv-crs required>
+          <option value="" selected disabled>&mdash; select UTM zone &mdash;</option>
+          <option value=mga54>MGA Zone 54 (138&deg;E&ndash;144&deg;E)</option>
+          <option value=mga55>MGA Zone 55 (144&deg;E&ndash;150&deg;E)</option>
+          <option value=mga56>MGA Zone 56 (150&deg;E&ndash;156&deg;E)</option>
+        </select>
+      </div>
+      <div class=fg><label>Row-gap threshold (m)</label><input id=fd-csv-gap type=number step=0.1 value=30></div>
+    </div>
+    <p class=note style="margin:-4px 0 10px">No default UTM zone &mdash; pick the zone the CSV was exported in (the wrong zone shifts the grid hundreds of metres without warning). Row-gap is the distance between consecutive points that signals the next row starts; 30 m suits typical orchard rows where trees are 3&ndash;6 m apart and rows are 100&ndash;500 m long.</p>
+    <button class="btn btn-p" onclick=csvUpload()><span>Upload CSV &amp; Apply</span><span class=bi>&#8593;</span></button>
+    <p class=note id=fd-csv-status>CSV must have a header row containing <b>X</b> and <b>Y</b> columns (UTM Easting / Northing in metres). Optional Index, Z, or other columns are ignored. Points must be pre-sorted in row-major order &mdash; each row contiguous, with one large XY jump between rows. The first valid (X,Y) point becomes the field anchor &mdash; no Field.txt or manual lat/lon needed.</p>
   </div>
   <div class=card>
     <div class=clbl>Active Line Names</div>
@@ -1186,6 +1259,39 @@ var dxfUpload=async ()=>{
       }
       st.textContent=msg;
       document.getElementById('fd-dl-trk').disabled=false;
+      fetchField();poll();refreshMapGrid();
+    } else {
+      st.style.color='var(--er)';
+      st.textContent='Upload failed: '+(d.error||'unknown error');
+      if(d.detail)st.textContent+=' — '+d.detail;
+    }
+  }catch(e){st.style.color='var(--er)';st.textContent='Upload failed: '+e;}
+};
+var csvUpload=async ()=>{
+  var st=document.getElementById('fd-csv-status');
+  var csv=document.getElementById('fd-csv').files[0];
+  if(!csv){alert('Pick a CSV file');return;}
+  var crs=document.getElementById('fd-csv-crs').value;
+  if(!crs){alert('Select a UTM zone — required, no default');return;}
+  var gap=document.getElementById('fd-csv-gap').value.trim();
+  var qs='csvCrs='+encodeURIComponent(crs);
+  if(gap)qs+='&rowGap='+encodeURIComponent(gap);
+  var fd=new FormData();
+  fd.append('csv',csv);
+  st.style.color='';
+  st.textContent='Uploading...';
+  try{
+    var r=await fetch('/field/csv?'+qs,{method:'POST',body:fd});
+    var txt=await r.text();
+    var d; try{d=JSON.parse(txt);}catch(e){d={ok:false,error:txt||('HTTP '+r.status)};}
+    if(d.ok){
+      var msg=d.intersections+' intersections from '+d.parsed+' parsed rows';
+      msg+=' ('+d.rows+' rows × max '+d.maxRowLen+' trees)';
+      if(d.badLines)msg+=', '+d.badLines+' bad lines';
+      if(d.overflow)msg+=' — OVERFLOW, some skipped';
+      msg+='. Anchor '+d.field.anchorLat.toFixed(7)+','+d.field.anchorLon.toFixed(7);
+      msg+=' (CRS '+d.csvCrs+', gap '+d.rowGap.toFixed(1)+'m).';
+      st.textContent=msg;
       fetchField();poll();refreshMapGrid();
     } else {
       st.style.color='var(--er)';
@@ -3126,6 +3232,7 @@ void handleFieldApply() {
   if (tn.length() > 0) strlcpy(gTreeLineName, tn.c_str(), sizeof(gTreeLineName));
   if (newMode == MODE_SIMPLE || newMode == MODE_AB) gGridMode = newMode;
   if      (src == "dxf")     gGridSource = SRC_DXF;
+  else if (src == "csv")     gGridSource = SRC_CSV;
   else if (src == "ablines") gGridSource = SRC_ABLINES;
 
   // v1.5.3: always reset visible grid state at the top so a stale
@@ -3149,6 +3256,19 @@ void handleFieldApply() {
       }
       prefs.end();
     }
+  } else if (gGridSource == SRC_CSV) {
+    // v1.6.0: reload the CSV intersection cache. Same pattern as DXF —
+    // separate NVS key (csv_pts) so the two caches don't collide.
+    if (gGridMode == MODE_AB) {
+      prefs.begin("tm", true);
+      size_t want = prefs.getBytesLength("csv_pts");
+      if (want > 0 && want <= (size_t)gIntersectionsCap * sizeof(IPt)) {
+        prefs.getBytes("csv_pts", intersections, want);
+        numIntersections = want / sizeof(IPt);
+        lastRawIntersections = numIntersections;
+      }
+      prefs.end();
+    }
   } else {
     resolveActiveABLines();
     if (gGridMode == MODE_AB && gHasLines) buildAbIntersections();
@@ -3159,7 +3279,7 @@ void handleFieldApply() {
   snprintf(out, sizeof(out),
     "{\"ok\":true,\"mode\":%d,\"source\":%d,\"linesOk\":%s,\"intersections\":%d}",
     gGridMode, gGridSource,
-    (gGridSource == SRC_DXF) ? "true" : (gHasLines ? "true" : "false"),
+    (gGridSource == SRC_DXF || gGridSource == SRC_CSV) ? "true" : (gHasLines ? "true" : "false"),
     numIntersections);
   webServer.send(200, "application/json", out);
 }
@@ -3591,6 +3711,347 @@ void handleDxfRaw() {
   f.close();
 }
 
+// ================================================================
+//  CSV upload — /field/csv  (v1.6.0)
+//
+//  Accepts a header row + data rows of UTM Easting/Northing in
+//  metres. Required columns are X (or EASTING) and Y (or NORTHING);
+//  any extra columns (Index, Z, etc.) are ignored. The CSV must be
+//  pre-sorted in row-major order: each orchard row is a contiguous
+//  block of points, with one large XY jump (>rowGap metres, default
+//  30) marking the transition between rows.
+//
+//  Query args:
+//    csvCrs  REQUIRED — mga54 | mga55 | mga56. No default; missing
+//                       or invalid → 400. The wrong UTM zone shifts
+//                       the grid by hundreds of metres silently, so
+//                       we'd rather force the user to pick than
+//                       guess from a default.
+//    rowGap  OPTIONAL — metres; gap between consecutive points that
+//                       triggers a row break (default 30, min 1).
+//
+//  Anchor: the first valid (X,Y) data row is inverted via
+//  utmToLatLon() and stored as gAnchorLat / gAnchorLon. Every other
+//  point then projects through the same anchor via latLonToLocal()
+//  so the resulting intersections[] sit in the AOG-compatible flat-
+//  Earth frame the rest of the firmware uses for hit detection.
+// ================================================================
+
+// 2 MB PSRAM cap on accumulated CSV bytes. Sculthorpe.csv is ~230 KB
+// (4,599 trees), so 8× headroom; the 32K-tree intersections cap
+// would top out around ~1.6 MB at 50 bytes per row, still under cap.
+#define MAX_CSV_BYTES (2 * 1024 * 1024)
+
+static char*  gCsvBuf = nullptr;
+static size_t gCsvCap = 0;
+static size_t gCsvLen = 0;
+static bool   gCsvUploadOk   = false;
+static bool   gCsvUploadSeen = false;
+static bool   gCsvOverflow   = false;
+
+static void csvUploadBegin() {
+  gCsvUploadOk   = false;
+  gCsvUploadSeen = false;
+  gCsvOverflow   = false;
+  gCsvLen = 0;
+  if (gCsvBuf == nullptr) {
+    gCsvBuf = (char*)ps_malloc(MAX_CSV_BYTES);
+    if (gCsvBuf) {
+      gCsvCap = MAX_CSV_BYTES;
+    } else {
+      // PSRAM unavailable — fall back to heap with a much smaller cap
+      gCsvCap = 96 * 1024;
+      gCsvBuf = (char*)malloc(gCsvCap);
+    }
+  }
+}
+
+static void csvUploadEndFree() {
+  if (gCsvBuf) { free(gCsvBuf); gCsvBuf = nullptr; gCsvCap = 0; gCsvLen = 0; }
+}
+
+void handleCsvUploadChunk() {
+  HTTPUpload& up = webServer.upload();
+  if (up.name != "csv") return;
+  if (up.status == UPLOAD_FILE_START) {
+    csvUploadBegin();
+    gCsvUploadSeen = true;
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (!gCsvBuf) return;
+    size_t avail = (gCsvCap > gCsvLen) ? (gCsvCap - gCsvLen) : 0;
+    size_t take  = up.currentSize;
+    if (take > avail) { take = avail; gCsvOverflow = true; }
+    if (take > 0) {
+      memcpy(gCsvBuf + gCsvLen, up.buf, take);
+      gCsvLen += take;
+    }
+  } else if (up.status == UPLOAD_FILE_END) {
+    if (gCsvLen > 0) gCsvUploadOk = true;
+  } else if (up.status == UPLOAD_FILE_ABORTED) {
+    csvUploadEndFree();
+  }
+}
+
+// Helper: parse a single comma-separated CSV line at the given byte
+// pointer + length, extracting the X and Y values at the requested
+// column indices. Returns true on success (both columns parsed as
+// numbers), false on any failure (missing column, non-numeric, etc.).
+static bool parseCsvDataLine(const char* line, size_t len,
+                             int xCol, int yCol,
+                             double& outX, double& outY) {
+  int col = 0;
+  size_t tokStart = 0;
+  bool gotX = false, gotY = false;
+  // Trim trailing CR
+  while (len > 0 && (line[len-1] == '\r' || line[len-1] == ' ' || line[len-1] == '\t')) len--;
+  for (size_t i = 0; i <= len; i++) {
+    if (i == len || line[i] == ',') {
+      if (col == xCol || col == yCol) {
+        // Copy token to a stack buffer (max 32 chars — UTM values are ~14 chars)
+        char buf[32];
+        size_t tlen = i - tokStart;
+        if (tlen >= sizeof(buf)) tlen = sizeof(buf) - 1;
+        memcpy(buf, line + tokStart, tlen);
+        buf[tlen] = '\0';
+        // Trim leading whitespace
+        char* p = buf;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '\0') return false;  // empty cell
+        char* endp = nullptr;
+        double v = strtod(p, &endp);
+        if (endp == p) return false;   // not a number
+        if (col == xCol) { outX = v; gotX = true; }
+        if (col == yCol) { outY = v; gotY = true; }
+      }
+      col++;
+      tokStart = i + 1;
+    }
+  }
+  return gotX && gotY;
+}
+
+// Helper: walk the CSV header line and locate the X and Y column
+// indices. Accepts X / EASTING and Y / NORTHING (case-insensitive)
+// in any order. Returns true if both were found.
+static bool parseCsvHeader(const char* line, size_t len,
+                           int& xCol, int& yCol) {
+  xCol = yCol = -1;
+  int col = 0;
+  size_t tokStart = 0;
+  while (len > 0 && (line[len-1] == '\r' || line[len-1] == ' ' || line[len-1] == '\t')) len--;
+  for (size_t i = 0; i <= len; i++) {
+    if (i == len || line[i] == ',') {
+      // Tokenize and uppercase
+      char buf[32];
+      size_t tlen = i - tokStart;
+      if (tlen >= sizeof(buf)) tlen = sizeof(buf) - 1;
+      memcpy(buf, line + tokStart, tlen);
+      buf[tlen] = '\0';
+      // Trim
+      char* p = buf;
+      while (*p == ' ' || *p == '\t') p++;
+      char* end = p + strlen(p);
+      while (end > p && (*(end-1) == ' ' || *(end-1) == '\t')) { end--; *end = '\0'; }
+      // Uppercase
+      for (char* q = p; *q; q++) {
+        if (*q >= 'a' && *q <= 'z') *q -= ('a' - 'A');
+      }
+      if      (strcmp(p, "X") == 0 || strcmp(p, "EASTING")  == 0) xCol = col;
+      else if (strcmp(p, "Y") == 0 || strcmp(p, "NORTHING") == 0) yCol = col;
+      col++;
+      tokStart = i + 1;
+    }
+  }
+  return (xCol >= 0 && yCol >= 0);
+}
+
+void handleCsvUploadEnd() {
+  if (!gCsvUploadSeen) {
+    sendJsonErr(400, "No CSV file uploaded", "Form field 'csv' missing");
+    csvUploadEndFree();
+    return;
+  }
+  if (gCsvOverflow) {
+    sendJsonErr(413, "CSV exceeds upload buffer cap",
+                "File too large for the firmware's PSRAM accumulator (2 MB cap).");
+    csvUploadEndFree();
+    return;
+  }
+  if (!gCsvUploadOk || gCsvLen == 0) {
+    sendJsonErr(500, "CSV upload failed mid-stream");
+    csvUploadEndFree();
+    return;
+  }
+
+  // Required UTM zone — no default. Wrong zone silently shifts the
+  // grid hundreds of metres, so we fail loud rather than guess.
+  String crs = webServer.arg("csvCrs");
+  int zone = 0;
+  if      (crs == "mga54") zone = 54;
+  else if (crs == "mga55") zone = 55;
+  else if (crs == "mga56") zone = 56;
+  else {
+    sendJsonErr(400, "csvCrs is required",
+                "Pass ?csvCrs=mga54 | mga55 | mga56. No default — wrong zone "
+                "silently shifts the grid hundreds of metres.");
+    csvUploadEndFree();
+    return;
+  }
+
+  // Optional row-break threshold. Within a row consecutive points are
+  // ~tree-spacing apart (typically 3–6 m); between rows the next point
+  // is whole-row-length away (typically >100 m). 30 m is well above any
+  // plausible tree spacing and well below any plausible single-row
+  // length, so it discriminates cleanly for normal orchard data.
+  String rgArg = webServer.arg("rowGap");
+  double rowGap = rgArg.length() ? rgArg.toDouble() : 30.0;
+  if (rowGap < 1.0) rowGap = 30.0;
+
+  // Find the header line (everything up to the first newline).
+  size_t headerEnd = 0;
+  while (headerEnd < gCsvLen && gCsvBuf[headerEnd] != '\n') headerEnd++;
+  if (headerEnd == 0) {
+    sendJsonErr(400, "CSV is empty");
+    csvUploadEndFree();
+    return;
+  }
+
+  int xCol = -1, yCol = -1;
+  if (!parseCsvHeader(gCsvBuf, headerEnd, xCol, yCol)) {
+    sendJsonErr(400, "CSV header missing X and/or Y columns",
+                "Required: X (or Easting) and Y (or Northing). Optional: Index, Z, others — ignored.");
+    csvUploadEndFree();
+    return;
+  }
+
+  // First pass: scan for the first parseable data row to use as anchor.
+  size_t pos = headerEnd;
+  while (pos < gCsvLen && (gCsvBuf[pos] == '\n' || gCsvBuf[pos] == '\r')) pos++;
+  size_t firstDataPos = pos;
+
+  bool anchorSet = false;
+  double anchorX = 0, anchorY = 0;
+  while (pos < gCsvLen) {
+    size_t lineEnd = pos;
+    while (lineEnd < gCsvLen && gCsvBuf[lineEnd] != '\n') lineEnd++;
+    if (lineEnd > pos) {
+      double X, Y;
+      if (parseCsvDataLine(gCsvBuf + pos, lineEnd - pos, xCol, yCol, X, Y)) {
+        anchorX = X; anchorY = Y; anchorSet = true;
+        break;
+      }
+    }
+    pos = lineEnd;
+    while (pos < gCsvLen && (gCsvBuf[pos] == '\n' || gCsvBuf[pos] == '\r')) pos++;
+  }
+  if (!anchorSet) {
+    sendJsonErr(400, "No valid (X,Y) data rows found in CSV");
+    csvUploadEndFree();
+    return;
+  }
+
+  // Set the anchor BEFORE the second pass — latLonToLocal projects
+  // every point relative to gAnchorLat/Lon, so the anchor must be live
+  // by the time we project the very first point (which happens to be
+  // the anchor itself, and should land at local (0,0) ± tiny rounding).
+  double aLat, aLon;
+  utmToLatLon(anchorX, anchorY, zone, aLat, aLon);
+  gAnchorLat = aLat; gAnchorLon = aLon; gHasField = true;
+
+  // Second pass: parse every data row, project, segment by row,
+  // populate intersections[].
+  numIntersections = 0;
+  int parsedCount = 0, badLines = 0;
+  int rowCount = 1;
+  int curRowLen = 0, maxRowLen = 0;
+  double prevE = 0, prevN = 0;
+  bool havePrev = false;
+  bool overflowed = false;
+
+  pos = firstDataPos;
+  while (pos < gCsvLen) {
+    size_t lineEnd = pos;
+    while (lineEnd < gCsvLen && gCsvBuf[lineEnd] != '\n') lineEnd++;
+    if (lineEnd > pos) {
+      double X, Y;
+      if (parseCsvDataLine(gCsvBuf + pos, lineEnd - pos, xCol, yCol, X, Y)) {
+        double lat, lon, le, ln;
+        utmToLatLon(X, Y, zone, lat, lon);
+        latLonToLocal(lat, lon, le, ln);
+
+        if (havePrev) {
+          double dx = le - prevE, dy = ln - prevN;
+          double d  = sqrt(dx*dx + dy*dy);
+          if (d > rowGap) {
+            if (curRowLen > maxRowLen) maxRowLen = curRowLen;
+            rowCount++;
+            curRowLen = 0;
+          }
+        }
+
+        if (numIntersections < gIntersectionsCap) {
+          intersections[numIntersections].e = (float)le;
+          intersections[numIntersections].n = (float)ln;
+          numIntersections++;
+        } else {
+          overflowed = true;
+        }
+
+        prevE = le; prevN = ln;
+        havePrev = true;
+        curRowLen++;
+        parsedCount++;
+      } else {
+        badLines++;
+      }
+    }
+    pos = lineEnd;
+    while (pos < gCsvLen && (gCsvBuf[pos] == '\n' || gCsvBuf[pos] == '\r')) pos++;
+  }
+  if (curRowLen > maxRowLen) maxRowLen = curRowLen;
+
+  if (parsedCount < 2) {
+    sendJsonErr(400, "CSV has fewer than 2 valid data rows",
+                badLines > 0 ? String("Bad lines: ") + badLines : String(""));
+    csvUploadEndFree();
+    return;
+  }
+
+  lastRawIntersections = parsedCount;
+  gCsvCrsUsed = crs;
+
+  // Switch to MODE_AB with CSV source and persist. gNumRows / gNumTrees
+  // get the CSV-derived values; saveGridPrefs() writes them to NVS so
+  // the dashboard's "x rows × y trees" tile reflects the loaded grid.
+  gGridMode   = MODE_AB;
+  gGridSource = SRC_CSV;
+  gHasLines   = false;
+  gNumRows  = rowCount;
+  gNumTrees = maxRowLen;
+  saveAbPrefs();
+  saveGridPrefs();
+
+  Serial.printf("[CSV] Upload OK: %d intersections from %d parsed rows "
+                "(%d rows × max %d trees), %d bad lines, anchor=(%.7f,%.7f), "
+                "zone=%d gap=%.1fm overflow=%s\n",
+                numIntersections, parsedCount, rowCount, maxRowLen, badLines,
+                gAnchorLat, gAnchorLon, zone, rowGap,
+                overflowed ? "true" : "false");
+
+  csvUploadEndFree();
+
+  char out[420];
+  snprintf(out, sizeof(out),
+    "{\"ok\":true,\"intersections\":%d,\"parsed\":%d,\"rows\":%d,"
+    "\"maxRowLen\":%d,\"badLines\":%d,\"overflow\":%s,"
+    "\"field\":{\"anchorLat\":%.7f,\"anchorLon\":%.7f},"
+    "\"csvCrs\":\"%s\",\"rowGap\":%.1f}",
+    numIntersections, parsedCount, rowCount, maxRowLen, badLines,
+    overflowed ? "true" : "false",
+    gAnchorLat, gAnchorLon, crs.c_str(), rowGap);
+  webServer.send(200, "application/json", out);
+}
+
 // GET /api/grid — planned tree positions as lat/lon, either from the
 // Simple grid[][] or from intersections[] in AB mode. Designed for the
 // dashboard Map tab to plot without needing its own maths.
@@ -3897,6 +4358,10 @@ void setup() {
       // intersections[] was restored from NVS by loadPrefs()
       Serial.printf("[DXF] Restored %d intersections from NVS cache\n",
                     numIntersections);
+    } else if (gGridSource == SRC_CSV) {
+      // intersections[] was restored from csv_pts by loadPrefs()
+      Serial.printf("[CSV] Restored %d intersections from NVS cache\n",
+                    numIntersections);
     } else {
       resolveActiveABLines();
       if (gHasLines) buildAbIntersections();
@@ -3932,6 +4397,7 @@ void setup() {
   webServer.on("/field/apply", HTTP_POST, handleFieldApply);
   webServer.on("/field/state", HTTP_GET,  handleFieldState);
   webServer.on("/field/dxf",   HTTP_POST, handleDxfUploadEnd, handleDxfUploadChunk);
+  webServer.on("/field/csv",   HTTP_POST, handleCsvUploadEnd, handleCsvUploadChunk);
   webServer.on("/field/tracklines/download", HTTP_GET, handleTracklinesDownload);
   webServer.on("/field/dxf/raw", HTTP_GET, handleDxfRaw);
   // Captive-portal catch-all: anything unknown in AP mode redirects to setup
